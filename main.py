@@ -129,109 +129,96 @@ TITLE_PREFIX_REGEX = re.compile(
     re.IGNORECASE,
 )
 
-
-DQ_TILES = [
-    # Kontakte
+DQ_CARDS = [
+    # ================= Kontakte =================
     {
         "group": "Kontakte",
         "title": "Vorname",
-        "subtitle": "Fehlende Daten",
-        "href": "/dq/contacts/missing?field=first_name",
-        "meta": "Field-Key: first_name",
-    },
-    {
-        "group": "Kontakte",
-        "title": "Vorname",
-        "subtitle": "Sonderzeichen / ungültige Zeichen",
-        "href": "/dq/contacts/invalidchars?field=first_name",
-        "meta": "Field-Key: first_name",
-    },
-    {
-        "group": "Kontakte",
-        "title": "Vorname",
-        "subtitle": "Titel im Vornamen (Dr. Simone → Simone)",
-        "href": "/dq/contacts/title_in_first_name",
-        "meta": "Field-Key: first_name",
+        "description": "Prüfungen für das Feld „first_name“.",
+        "actions": [
+            {"label": "Fehlende Daten", "href": "/dq/contacts/missing?field=first_name"},
+            {"label": "Ungültige Zeichen", "href": "/dq/contacts/invalidchars?field=first_name"},
+            {"label": "Titel im Vornamen", "href": "/dq/contacts/title_in_first_name"},
+        ],
     },
     {
         "group": "Kontakte",
         "title": "Nachname",
-        "subtitle": "Fehlende Daten",
-        "href": "/dq/contacts/missing?field=last_name",
-        "meta": "Field-Key: last_name",
-    },
-    {
-        "group": "Kontakte",
-        "title": "Nachname",
-        "subtitle": "Sonderzeichen / ungültige Zeichen",
-        "href": "/dq/contacts/invalidchars?field=last_name",
-        "meta": "Field-Key: last_name",
+        "description": "Prüfungen für das Feld „last_name“.",
+        "actions": [
+            {"label": "Fehlende Daten", "href": "/dq/contacts/missing?field=last_name"},
+            {"label": "Ungültige Zeichen", "href": "/dq/contacts/invalidchars?field=last_name"},
+        ],
     },
     {
         "group": "Kontakte",
         "title": "Geschlecht",
-        "subtitle": "Fehlende Daten",
-        "href": f"/dq/contacts/missing?field={PD_PERSON_GENDER_KEY}",
-        "meta": f"Field-Key: {PD_PERSON_GENDER_KEY}",
+        "description": "Fehlende Werte prüfen.",
+        "actions": [
+            {"label": "Fehlende Daten", "href": f"/dq/contacts/missing?field={PD_PERSON_GENDER_KEY}"},
+        ],
     },
     {
         "group": "Kontakte",
         "title": "E-Mail-Adresse",
-        "subtitle": "Fehlende Daten",
-        "href": "/dq/contacts/missing?field=email",
-        "meta": "Field-Key: email",
+        "description": "Fehlende Werte prüfen.",
+        "actions": [
+            {"label": "Fehlende Daten", "href": "/dq/contacts/missing?field=email"},
+        ],
     },
     {
         "group": "Kontakte",
         "title": "Du oder Sie",
-        "subtitle": "Fehlende Daten",
-        "href": f"/dq/contacts/missing?field={PD_PERSON_DU_SIE_KEY}",
-        "meta": f"Field-Key: {PD_PERSON_DU_SIE_KEY}",
+        "description": "Fehlende Werte prüfen.",
+        "actions": [
+            {"label": "Fehlende Daten", "href": f"/dq/contacts/missing?field={PD_PERSON_DU_SIE_KEY}"},
+        ],
     },
     {
         "group": "Kontakte",
         "title": "Position",
-        "subtitle": "Fehlende Daten",
-        "href": f"/dq/contacts/missing?field={PD_PERSON_POSITION_KEY}",
-        "meta": f"Field-Key: {PD_PERSON_POSITION_KEY}",
+        "description": "Fehlende Werte prüfen.",
+        "actions": [
+            {"label": "Fehlende Daten", "href": f"/dq/contacts/missing?field={PD_PERSON_POSITION_KEY}"},
+        ],
     },
     {
         "group": "Kontakte",
         "title": "LinkedIn-URL",
-        "subtitle": "Fehlende Daten",
-        "href": f"/dq/contacts/missing?field={PD_PERSON_LINKEDIN_KEY}",
-        "meta": f"Field-Key: {PD_PERSON_LINKEDIN_KEY}",
+        "description": "Fehlende Werte prüfen.",
+        "actions": [
+            {"label": "Fehlende Daten", "href": f"/dq/contacts/missing?field={PD_PERSON_LINKEDIN_KEY}"},
+        ],
     },
-    # Organisationen
+
+    # ================= Organisationen =================
     {
         "group": "Organisationen",
         "title": "Name / Rechtsform",
-        "subtitle": "Fehlende Daten",
-        "href": f"/dq/orgs/missing?field={PD_ORG_NAME_KEY}",
-        "meta": f"Field-Key: {PD_ORG_NAME_KEY}",
-    },
-    {
-        "group": "Organisationen",
-        "title": "Name / Rechtsform",
-        "subtitle": "Sonderzeichen / ungültige Zeichen",
-        "href": f"/dq/orgs/invalidchars?field={PD_ORG_NAME_KEY}",
-        "meta": f"Field-Key: {PD_ORG_NAME_KEY}",
+        "description": "Prüfung auf Lücken & ungültige Zeichen.",
+        "actions": [
+            {"label": "Fehlende Daten", "href": f"/dq/orgs/missing?field={PD_ORG_NAME_KEY}"},
+            {"label": "Ungültige Zeichen", "href": f"/dq/orgs/invalidchars?field={PD_ORG_NAME_KEY}"},
+        ],
     },
     {
         "group": "Organisationen",
         "title": "Adresse",
-        "subtitle": "Fehlende Daten",
-        "href": f"/dq/orgs/missing?field={PD_ORG_ADDRESS_KEY}",
-        "meta": f"Field-Key: {PD_ORG_ADDRESS_KEY}",
+        "description": "Fehlende Werte prüfen.",
+        "actions": [
+            {"label": "Fehlende Daten", "href": f"/dq/orgs/missing?field={PD_ORG_ADDRESS_KEY}"},
+        ],
     },
     {
         "group": "Organisationen",
         "title": "Website",
-        "subtitle": "Fehlende Daten",
-        "href": f"/dq/orgs/missing?field={PD_ORG_WEBSITE_KEY}",
-        "meta": f"Field-Key: {PD_ORG_WEBSITE_KEY}",
+        "description": "Fehlende Werte prüfen.",
+        "actions": [
+            {"label": "Fehlende Daten", "href": f"/dq/orgs/missing?field={PD_ORG_WEBSITE_KEY}"},
+        ],
     },
 ]
+
 
 
 ########################################################################
@@ -429,38 +416,49 @@ def page_shell(title: str, body_html: str) -> str:
         .btn-primary:hover{{ background:var(--brand-hover); }}
         .btn-outline{{ background:white; color:var(--text); border-color:var(--border); box-shadow:0 2px 10px rgba(15,23,42,.04);}}
         .btn-outline:hover{{ background:#f8fafc; }}
+        .btn-sm{
+          padding:8px 10px;
+          border-radius:12px;
+          font-weight:900;
+          font-size:13px;
+          box-shadow:0 2px 10px rgba(15,23,42,.06);
+        }
 
         .grid{{
           display:grid;
-          grid-template-columns: repeat(3, minmax(0, 1fr));
-          gap:18px;
+          grid-template-columns: repeat(4, minmax(0, 1fr));
+          gap:14px;
         }}
-        @media (max-width: 1100px){{ .grid{{ grid-template-columns: repeat(2, minmax(0,1fr)); }} }}
-        @media (max-width: 700px){{ .grid{{ grid-template-columns: 1fr; }} }}
-
-        .card{{
+        @media (max-width: 1200px){ .grid{ grid-template-columns: repeat(3, minmax(0,1fr)); } }
+        @media (max-width: 900px){ .grid{ grid-template-columns: repeat(2, minmax(0,1fr)); } }
+        @media (max-width: 620px){ .grid{ grid-template-columns: 1fr; } }
+       
+        .card{
           background:var(--card);
           border:1px solid var(--border);
-          border-radius:18px;
-          box-shadow:var(--shadow);
-          padding:18px 18px 16px;
+          border-radius:16px;
+          box-shadow:0 8px 20px rgba(15,23,42,.06);
+          padding:14px 14px 12px;
           display:flex;
           flex-direction:column;
-          min-height:170px;
-        }}
-        .card h3{{
+          min-height:132px;
+        }
+        .card-top{
+          flex:1;
+        }
+        .card h3{
           margin:0;
-          font-size:18px;
-          font-weight:950;
+          font-size:16px;
+          font-weight:900;
           letter-spacing:.2px;
-        }}
-        .card .desc{{
-          margin-top:10px;
+        }
+        .card-desc{
+          margin-top:8px;
           color:var(--muted);
           font-weight:700;
+          font-size:13px;
           line-height:1.35;
-          flex:1;
-        }}
+        }
         .card .meta{{
           margin-top:10px;
           font-size:12px;
@@ -472,15 +470,13 @@ def page_shell(title: str, body_html: str) -> str:
           display:flex;
           justify-content:flex-start;
         }}
-        .group-title{{
-          margin:22px 0 10px;
-          font-size:14px;
-          color:var(--muted);
-          font-weight:950;
-          letter-spacing:.12em;
-          text-transform:uppercase;
-        }}
-
+        .actions-row{
+          margin-top:12px;
+          display:flex;
+          flex-wrap:wrap;
+          gap:8px;
+        }
+      
         /* Table */
         .panel{{
           background:var(--card);
@@ -527,6 +523,36 @@ def page_shell(title: str, body_html: str) -> str:
           outline:none;
           font-weight:700;
         }}
+        .section-header{
+          margin:18px 0 10px;
+          padding:12px 14px;
+          border-radius:16px;
+          border:1px solid var(--border);
+          background:linear-gradient(180deg,#ffffff,#fbfdff);
+          display:flex;
+          justify-content:space-between;
+          align-items:baseline;
+          gap:10px;
+        }
+        .section-header.contacts{
+          border-left:6px solid #0ea5e9;
+        }
+        .section-header.orgs{
+          border-left:6px solid #8b5cf6;
+        }
+        .section-title{
+          font-size:13px;
+          font-weight:950;
+          letter-spacing:.12em;
+          text-transform:uppercase;
+          color:var(--text);
+        }
+        .section-sub{
+          font-size:12px;
+          font-weight:800;
+          color:var(--muted);
+        }
+
         .row-actions{{ display:flex; gap:8px; align-items:center; }}
       </style>
     </head>
@@ -563,27 +589,41 @@ def page_shell(title: str, body_html: str) -> str:
     </html>
     """
 
+def _render_cards(group: str) -> str:
+    cards = [c for c in DQ_CARDS if c["group"] == group]
 
-def _render_tiles(group: str) -> str:
-    tiles = [t for t in DQ_TILES if t["group"] == group]
-    cards = []
-    for t in tiles:
-        cards.append(f"""
+    group_class = "contacts" if group == "Kontakte" else "orgs"
+    group_sub = "Personenbezogene Prüfungen" if group == "Kontakte" else "Firmendaten / Stammdaten"
+
+    card_html = []
+    for c in cards:
+        actions_html = []
+        for a in c.get("actions", []):
+            actions_html.append(f'<a class="btn btn-sm btn-primary" href="{a["href"]}">{a["label"]}</a>')
+
+        card_html.append(f"""
           <div class="card">
-            <h3>{t["title"]}</h3>
-            <div class="desc">{t["subtitle"]}</div>
-            <div class="meta">{t["meta"]}</div>
-            <div class="actions">
-              <a class="btn btn-primary" href="{t["href"]}">Öffnen</a>
+            <div class="card-top">
+              <h3>{c["title"]}</h3>
+              <div class="card-desc">{c.get("description","")}</div>
+            </div>
+            <div class="actions-row">
+              {''.join(actions_html)}
             </div>
           </div>
         """)
+
     return f"""
-      <div class="group-title">{group}</div>
+      <div class="section-header {group_class}">
+        <div class="section-title">{group}</div>
+        <div class="section-sub">{group_sub}</div>
+      </div>
       <div class="grid">
-        {''.join(cards)}
+        {''.join(card_html)}
       </div>
     """
+
+
 
 
 ########################################################################
@@ -607,8 +647,8 @@ async def overview(request: Request):
         </div>
       </div>
 
-      {_render_tiles("Kontakte")}
-      {_render_tiles("Organisationen")}
+      {_render_cards("Kontakte")}
+      {_render_cards("Organisationen")}
     """
     return HTMLResponse(page_shell("Datenqualität – Übersicht", body))
 
