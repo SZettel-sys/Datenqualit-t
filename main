@@ -12,7 +12,12 @@ from fastapi.staticfiles import StaticFiles
 
 app = FastAPI()
 
-# ================== Konfiguration ==================
+########################################################################
+#
+# Konfiguration
+#
+########################################################################
+
 CLIENT_ID = os.getenv("PD_CLIENT_ID")
 CLIENT_SECRET = os.getenv("PD_CLIENT_SECRET")
 BASE_URL = os.getenv("BASE_URL")
@@ -26,22 +31,38 @@ PIPEDRIVE_API_V2_URL = "https://api.pipedrive.com/api/v2"
 
 user_tokens: dict[str, str] = {}
 
-# ================== DB ==================
+########################################################################
+#
+# DB
+#
+########################################################################
 DB_URL = os.getenv("DATABASE_URL")
 
-# ================== Static ==================
-# (nur mounten, wenn der Ordner existiert – sonst crasht FastAPI beim Start)
+########################################################################
+#
+# Static
+#
+########################################################################
 if os.path.isdir("static"):
     app.mount("/static", StaticFiles(directory="static"), name="static")
 
 
-# ================== Root ==================
+########################################################################
+#
+# Root
+#
+########################################################################
 @app.get("/")
 def root():
     return RedirectResponse("/overview")
 
 
-# ================== Login (OAuth) ==================
+########################################################################
+#
+# LogIn
+#
+########################################################################
+
 @app.get("/login")
 def login():
     return RedirectResponse(
@@ -83,7 +104,11 @@ def extract_address(address_value):
     return address_value or "-"
 
 
-# ================== DQ Konfiguration (Tiles) ==================
+########################################################################
+#
+# KONSTANTEN / VARIABLEN
+#
+########################################################################
 # Kontakt-Feldkeys
 PD_PERSON_GENDER_KEY = "c4f5f434cdb0cfce3f6d62ec7291188fe968ac72"
 PD_PERSON_DU_SIE_KEY = "1fde2275ff2973c9062d64f1612122384b5902cf"
@@ -209,7 +234,12 @@ DQ_TILES = [
 ]
 
 
-# ================== Pipedrive Fetch Helpers ==================
+########################################################################
+#
+#  Pipedrive Fetch Helpers
+#
+########################################################################
+
 def _scalarize(v: Any) -> str:
     """Versucht, den Wert UI-tauglich als String zu machen (inkl. v2 email/list/dict)."""
     if v is None:
@@ -306,7 +336,13 @@ async def pipedrive_update_v2(entity: str, entity_id: int, payload: dict, header
         raise RuntimeError(f"Update fehlgeschlagen ({r2.status_code}): {r2.text}")
 
 
-# ================== HTML Helpers ==================
+
+########################################################################
+#
+#  HTML HELPER
+#
+########################################################################
+
 def page_shell(title: str, body_html: str) -> str:
     # Logo optional
     logo_html = ""
@@ -550,7 +586,11 @@ def _render_tiles(group: str) -> str:
     """
 
 
-# ================== Overview (Startseite) ==================
+########################################################################
+#
+#  OVERVIEW
+#
+########################################################################
 @app.get("/overview", response_class=HTMLResponse)
 async def overview(request: Request):
     if "default" not in user_tokens:
@@ -579,7 +619,11 @@ def logout():
     return RedirectResponse("/overview")
 
 
-# ================== DQ Endpunkte: Kontakte ==================
+########################################################################
+#
+#  ENDPUNKTE KONTAKTE
+#
+########################################################################
 async def _dq_scan_contacts_missing(field_key: str) -> list[dict]:
     headers = get_headers()
     if not headers:
@@ -756,7 +800,10 @@ async def dq_contacts_title_in_first_name():
     return HTMLResponse(page_shell(title, body))
 
 
-# ================== DQ Endpunkte: Organisationen ==================
+########################################################################
+#
+#  ENDPUNKTE ORGANISATIONEN
+########################################################################
 async def _dq_scan_orgs_missing(field_key: str) -> list[dict]:
     headers = get_headers()
     if not headers:
@@ -826,7 +873,11 @@ async def dq_orgs_invalidchars(field: str):
     return HTMLResponse(page_shell(title, body))
 
 
-# ================== Update Endpoint ==================
+########################################################################
+#
+# ENDPUNKTE UPDATE
+#
+########################################################################
 @app.post("/dq/update")
 async def dq_update(payload: dict = Body(...)):
     """
@@ -863,7 +914,11 @@ async def dq_update(payload: dict = Body(...)):
         return {"ok": False, "error": str(e)}
 
 
-# ================== Lokaler Start ==================
+########################################################################
+#
+#  LOKALER START
+#
+########################################################################
 if __name__ == "__main__":
     import uvicorn
 
