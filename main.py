@@ -95,6 +95,9 @@ async def init_db():
           last_update_time TIMESTAMPTZ NOT NULL
         );
         """)
+        await conn.execute("ALTER TABLE sync_state ADD COLUMN IF NOT EXISTS last_cursor TEXT;")
+        await conn.execute("ALTER TABLE sync_state ADD COLUMN IF NOT EXISTS full_in_progress BOOLEAN NOT NULL DEFAULT FALSE;")
+
 
         # Indizes für schnelle "Vorname fehlt" Queries + Join
         await conn.execute("""
@@ -133,6 +136,22 @@ async def set_sync_time(entity: str, t: datetime):
             VALUES($1, $2)
             ON CONFLICT(entity) DO UPDATE SET last_update_time=EXCLUDED.last_update_time
         """, entity, t)
+
+async def get_sync_cursor(entity: str) -> tuple[Optional[str], bool]:
+    async with db_pool.acquire() as conn:
+        row = await conn.fetchrow("SELECT last_cursor, full_in_progress FROM sync_state WHERE entity=$1", entity)
+        if not row:
+            return None, False
+        return row["last_cursor"], bool(row["full_in_progress"])
+
+
+async def set_sync_cursor(entity: str, cursor: Optional[str], in_progress: bool):
+    async with db_pool.acquire() as conn:
+        await conn.execute("""
+            UPDATE sync_state
+            SET last_cursor=$2, full_in_progress=$3
+            WHERE entity=$1
+        """, entity, cursor, in_progress)
 
 @app.on_event("startup")
 async def _startup():
@@ -240,7 +259,7 @@ DQ_CARDS = [
     {
         "group": "Kontakte",
         "title": "Vorname",
-        "description": "Prüfungen für das Feld „first_name“.",
+        "description": "",
         "actions": [
             {"label": "Fehlende Daten", "href": "/dq/contacts/first_name/missing"},
             {"label": "Ungültige Zeichen", "href": "/dq/contacts/invalidchars?field=first_name"},
@@ -250,7 +269,7 @@ DQ_CARDS = [
     {
         "group": "Kontakte",
         "title": "Nachname",
-        "description": "Prüfungen für das Feld „last_name“.",
+        "description": "",
         "actions": [
             {"label": "Fehlende Daten", "href": "/dq/contacts/missing?field=last_name"},
             {"label": "Ungültige Zeichen", "href": "/dq/contacts/invalidchars?field=last_name"},
@@ -259,7 +278,7 @@ DQ_CARDS = [
     {
         "group": "Kontakte",
         "title": "Geschlecht",
-        "description": "Fehlende Werte prüfen.",
+        "description": "",
         "actions": [
             {"label": "Fehlende Daten", "href": f"/dq/contacts/missing?field={PD_PERSON_GENDER_KEY}"},
         ],
@@ -267,7 +286,7 @@ DQ_CARDS = [
     {
         "group": "Kontakte",
         "title": "E-Mail-Adresse",
-        "description": "Fehlende Werte prüfen.",
+        "description": "",
         "actions": [
             {"label": "Fehlende Daten", "href": "/dq/contacts/missing?field=email"},
         ],
@@ -275,7 +294,7 @@ DQ_CARDS = [
     {
         "group": "Kontakte",
         "title": "Du oder Sie",
-        "description": "Fehlende Werte prüfen.",
+        "description": "",
         "actions": [
             {"label": "Fehlende Daten", "href": f"/dq/contacts/missing?field={PD_PERSON_DU_SIE_KEY}"},
         ],
@@ -283,7 +302,7 @@ DQ_CARDS = [
     {
         "group": "Kontakte",
         "title": "Position",
-        "description": "Fehlende Werte prüfen.",
+        "description": "",
         "actions": [
             {"label": "Fehlende Daten", "href": f"/dq/contacts/missing?field={PD_PERSON_POSITION_KEY}"},
         ],
@@ -291,7 +310,7 @@ DQ_CARDS = [
     {
         "group": "Kontakte",
         "title": "LinkedIn-URL",
-        "description": "Fehlende Werte prüfen.",
+        "description": "",
         "actions": [
             {"label": "Fehlende Daten", "href": f"/dq/contacts/missing?field={PD_PERSON_LINKEDIN_KEY}"},
         ],
@@ -301,7 +320,7 @@ DQ_CARDS = [
     {
         "group": "Organisationen",
         "title": "Name / Rechtsform",
-        "description": "Prüfung auf Lücken & ungültige Zeichen.",
+        "description": "",
         "actions": [
             {"label": "Fehlende Daten", "href": f"/dq/orgs/missing?field={PD_ORG_NAME_KEY}"},
             {"label": "Ungültige Zeichen", "href": f"/dq/orgs/invalidchars?field={PD_ORG_NAME_KEY}"},
@@ -310,7 +329,7 @@ DQ_CARDS = [
     {
         "group": "Organisationen",
         "title": "Adresse",
-        "description": "Fehlende Werte prüfen.",
+        "description": "",
         "actions": [
             {"label": "Fehlende Daten", "href": f"/dq/orgs/missing?field={PD_ORG_ADDRESS_KEY}"},
         ],
@@ -318,7 +337,7 @@ DQ_CARDS = [
     {
         "group": "Organisationen",
         "title": "Website",
-        "description": "Fehlende Werte prüfen.",
+        "description": "",
         "actions": [
             {"label": "Fehlende Daten", "href": f"/dq/orgs/missing?field={PD_ORG_WEBSITE_KEY}"},
         ],
@@ -583,22 +602,74 @@ async def sync_persons_incremental(full: bool = False, max_pages: int = 20) -> d
     if not headers:
         raise RuntimeError("Nicht eingeloggt")
 
-    since = await get_sync_time("persons")
-    # Overlap (2 Minuten) gegen Race Conditions / Uhrzeit-Granularität
-    if not full:
-        since = since - timedelta(minutes=2)
-
     params = {"limit": 500}
-    # Wenn Pipedrive updated_since unterstützt:
-    if not full:
-        params["updated_since"] = since.isoformat()
 
-    # optional: Felder reduzieren (falls API das unterstützt – wenn nicht, rausnehmen)
-    # params["include_fields"] = "id,first_name,last_name,email,org_id,update_time"
-    # params["custom_fields"] = f"{PD_PERSON_GENDER_KEY},{PD_PERSON_DU_SIE_KEY},{PD_PERSON_POSITION_KEY},{PD_PERSON_LINKEDIN_KEY}"
+    cursor = None
+    if full:
+        cursor, in_progress = await get_sync_cursor("persons")
+        # wenn kein Cursor gespeichert: neuer Initial-Lauf
+        if not in_progress:
+            await set_sync_cursor("persons", None, True)
+            cursor = None
+    else:
+        since = await get_sync_time("persons") - timedelta(minutes=2)
+        params["updated_since"] = since.isoformat()
 
     max_seen: Optional[datetime] = None
     total = 0
+    pages = 0
+
+    async with httpx.AsyncClient(timeout=60.0) as client:
+        while True:
+            p = dict(params)
+            if cursor:
+                p["cursor"] = cursor
+
+            resp = await client.get(f"{PIPEDRIVE_API_V2_URL}/persons", headers=headers, params=p)
+            if resp.status_code != 200:
+                raise RuntimeError(f"Pipedrive API Fehler ({resp.status_code}): {resp.text}")
+
+            payload = resp.json() or {}
+            items = payload.get("data") or []
+            add = payload.get("additional_data") or {}
+            next_cursor = add.get("next_cursor")
+
+            if items:
+                total += len(items)
+                ts = await upsert_persons(items)
+                if ts and (max_seen is None or ts > max_seen):
+                    max_seen = ts
+
+            cursor = next_cursor
+            pages += 1
+
+            # Cursor speichern, damit der nächste Klick weitermacht
+            if full:
+                await set_sync_cursor("persons", cursor, True)
+
+            if max_pages and pages >= max_pages:
+                break
+            if not cursor:
+                break
+
+    # Sync-Time nur bei inkrementell relevant (und optional auch bei full)
+    if max_seen:
+        await set_sync_time("persons", max_seen)
+
+    # Wenn full fertig (cursor None), dann Initial-Mode beenden
+    if full and not cursor:
+        await set_sync_cursor("persons", None, False)
+
+    return {
+        "entity": "persons",
+        "full": full,
+        "max_pages": max_pages,
+        "processed": total,
+        "pages": pages,
+        "cursor_remaining": bool(cursor),
+        "new_sync_time": max_seen.isoformat() if max_seen else None
+    }
+
 
     async for items in iter_v2_pages("persons", headers=headers, params=params, max_pages=max_pages):
         total += len(items)
@@ -617,27 +688,86 @@ async def sync_orgs_incremental(full: bool = False, max_pages: int = 20) -> dict
     if not headers:
         raise RuntimeError("Nicht eingeloggt")
 
-    since = await get_sync_time("organizations")
-    if not full:
-        since = since - timedelta(minutes=2)
-
     params = {"limit": 500}
-    if not full:
+
+    cursor = None
+    if full:
+        cursor, in_progress = await get_sync_cursor("organizations")
+        if not in_progress:
+            await set_sync_cursor("organizations", None, True)
+            cursor = None
+    else:
+        since = await get_sync_time("organizations") - timedelta(minutes=2)
         params["updated_since"] = since.isoformat()
 
     max_seen: Optional[datetime] = None
     total = 0
+    pages = 0
 
-    async for items in iter_v2_pages("organizations", headers=headers, params=params, max_pages=max_pages):
-        total += len(items)
-        ts = await upsert_orgs(items)
-        if ts and (max_seen is None or ts > max_seen):
-            max_seen = ts
+    async with httpx.AsyncClient(timeout=60.0) as client:
+        while True:
+            p = dict(params)
+            if cursor:
+                p["cursor"] = cursor
+
+            resp = await client.get(f"{PIPEDRIVE_API_V2_URL}/organizations", headers=headers, params=p)
+            if resp.status_code != 200:
+                raise RuntimeError(f"Pipedrive API Fehler ({resp.status_code}): {resp.text}")
+
+            payload = resp.json() or {}
+            items = payload.get("data") or []
+            add = payload.get("additional_data") or {}
+            next_cursor = add.get("next_cursor")
+
+            if items:
+                total += len(items)
+                ts = await upsert_orgs(items)
+                if ts and (max_seen is None or ts > max_seen):
+                    max_seen = ts
+
+            cursor = next_cursor
+            pages += 1
+
+            if full:
+                await set_sync_cursor("organizations", cursor, True)
+
+            if max_pages and pages >= max_pages:
+                break
+            if not cursor:
+                break
 
     if max_seen:
         await set_sync_time("organizations", max_seen)
 
-    return {"entity": "organizations", "full": full, "max_pages": max_pages, "processed": total, "new_sync_time": max_seen.isoformat() if max_seen else None}
+    if full and not cursor:
+        await set_sync_cursor("organizations", None, False)
+
+    return {
+        "entity": "organizations",
+        "full": full,
+        "max_pages": max_pages,
+        "processed": total,
+        "pages": pages,
+        "cursor_remaining": bool(cursor),
+        "new_sync_time": max_seen.isoformat() if max_seen else None
+    }
+
+@app.get("/admin/sync/reset")
+async def admin_sync_reset(entity: str = "persons"):
+    if not db_pool:
+        return {"ok": False, "error": "DB nicht initialisiert"}
+    if entity not in ("persons", "organizations"):
+        return {"ok": False, "error": "entity muss 'persons' oder 'organizations' sein"}
+
+    async with db_pool.acquire() as conn:
+        await conn.execute("""
+          UPDATE sync_state
+          SET last_update_time=$2, last_cursor=NULL, full_in_progress=FALSE
+          WHERE entity=$1
+        """, entity, datetime(1970,1,1,tzinfo=timezone.utc))
+
+    return {"ok": True, "entity": entity, "reset": True}
+
 
 ########################################################################
 #
@@ -705,7 +835,8 @@ def _render_cards(group: str) -> str:
     for c in cards:
         actions_html = []
         for a in c.get("actions", []):
-            actions_html.append(f'<a class="btn btn-sm btn-primary" href="{a["href"]}">{a["label"]}</a>')
+            actions_html.append(f'<a class="chip" href="{a["href"]}">{a["label"]}</a>')
+
 
         card_html.append(f"""
           <div class="card">
@@ -1351,6 +1482,23 @@ async def admin_sync_status():
     p = await get_sync_time("persons")
     o = await get_sync_time("organizations")
     return {"ok": True, "persons_last": p.isoformat(), "orgs_last": o.isoformat()}
+
+@app.get("/admin/cache/counts")
+async def admin_cache_counts():
+    if not db_pool:
+        return {"ok": False, "error": "DB nicht initialisiert"}
+    async with db_pool.acquire() as conn:
+        persons = await conn.fetchval("SELECT COUNT(*) FROM persons_cache")
+        orgs = await conn.fetchval("SELECT COUNT(*) FROM orgs_cache")
+        missing_first = await conn.fetchval(
+            "SELECT COUNT(*) FROM persons_cache WHERE first_name IS NULL OR btrim(first_name)=''"
+        )
+    return {
+        "ok": True,
+        "persons_cache": int(persons),
+        "orgs_cache": int(orgs),
+        "missing_first_name": int(missing_first),
+    }
 
 
 ########################################################################
