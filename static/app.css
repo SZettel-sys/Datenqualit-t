@@ -6,12 +6,13 @@
   --border:#e5e7eb;
 
   --brand:#0ea5e9;
-  --brand-hover:#0284c7;
+  --brand-ink:#0369a1;
 
   --violet:#8b5cf6;
 
   --shadow:0 10px 25px rgba(15,23,42,.08);
 }
+
 
 *{ box-sizing:border-box; }
 
@@ -21,8 +22,8 @@ html, body{
 
 body{
   font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, Arial, "Noto Sans", "Liberation Sans", sans-serif;
-  background: radial-gradient(1200px 500px at 20% 0%, #eef6ff 0%, transparent 55%),
-              radial-gradient(900px 600px at 90% 10%, #f4f0ff 0%, transparent 55%),
+  background: radial-gradient(1200px 500px at 15% 0%, rgba(14,165,233,.10) 0%, transparent 55%),
+              radial-gradient(900px 600px at 90% 10%, rgba(139,92,246,.10) 0%, transparent 55%),
               var(--bg);
   margin:0;
   color:var(--text);
@@ -40,7 +41,6 @@ header{
   top:0;
   z-index:10;
 }
-
 header img{ height:44px; }
 
 .container{
@@ -48,6 +48,7 @@ header img{ height:44px; }
   margin: 18px auto 90px;
   padding: 0 14px;
 }
+
 
 .topbar{
   display:flex;
@@ -60,14 +61,13 @@ header img{ height:44px; }
 
 .title{
   font-size:22px;
-  font-weight:950;
-  letter-spacing:.2px;
+  font-weight:800;
+  letter-spacing:.1px;
 }
-
 .subtitle{
   margin-top:6px;
   color:var(--muted);
-  font-weight:750;
+  font-weight:650;
 }
 
 .btn{
@@ -75,7 +75,7 @@ header img{ height:44px; }
   border:1px solid transparent;
   border-radius:14px;
   padding:10px 14px;
-  font-weight:900;
+  font-weight:750;
   cursor:pointer;
   display:inline-flex;
   align-items:center;
@@ -84,19 +84,11 @@ header img{ height:44px; }
   text-decoration:none;
   user-select:none;
 }
-
 .btn:active{ transform: translateY(1px); }
-
-.btn-primary{
-  background: var(--brand);
-  color: #fff;
-  box-shadow: 0 8px 18px rgba(14,165,233,.22);
-}
-.btn-primary:hover{ background: var(--brand-hover); }
 
 .btn-outline{
   background: rgba(255,255,255,.85);
-  color: var(--text);
+  color: #111827;
   border-color: var(--border);
   box-shadow: 0 6px 16px rgba(15,23,42,.06);
 }
@@ -105,12 +97,14 @@ header img{ height:44px; }
   border-color:#dbe3ee;
 }
 
-.btn-sm{
-  padding:8px 10px;
-  border-radius:12px;
-  font-weight:950;
-  font-size:13px;
+.btn-primary{
+  background: var(--brand);
+  color:#fff;
+  box-shadow: 0 8px 18px rgba(14,165,233,.18);
 }
+.btn-primary:hover{ background:#0284c7; }
+
+
 
 /* ===== Sections (Kontakte/Organisationen) ===== */
 .section-header{
@@ -118,7 +112,7 @@ header img{ height:44px; }
   padding:12px 14px;
   border-radius:16px;
   border:1px solid var(--border);
-  background: linear-gradient(180deg, rgba(255,255,255,.92), rgba(255,255,255,.68));
+  background: linear-gradient(180deg, rgba(255,255,255,.92), rgba(255,255,255,.70));
   display:flex;
   justify-content:space-between;
   align-items:baseline;
@@ -131,14 +125,14 @@ header img{ height:44px; }
 
 .section-title{
   font-size:12px;
-  font-weight:950;
+  font-weight:850;
   letter-spacing:.14em;
   text-transform:uppercase;
+  color:#1f2937;
 }
-
 .section-sub{
   font-size:12px;
-  font-weight:800;
+  font-weight:700;
   color:var(--muted);
 }
 
@@ -148,7 +142,6 @@ header img{ height:44px; }
   grid-template-columns: repeat(4, minmax(0, 1fr));
   gap:14px;
 }
-
 @media (max-width: 1200px){ .grid{ grid-template-columns: repeat(3, minmax(0,1fr)); } }
 @media (max-width: 900px){ .grid{ grid-template-columns: repeat(2, minmax(0,1fr)); } }
 @media (max-width: 620px){ .grid{ grid-template-columns: 1fr; } }
@@ -161,24 +154,26 @@ header img{ height:44px; }
   padding: 14px 14px 12px;
   display:flex;
   flex-direction:column;
-  min-height: 132px;
+  min-height: 128px;
 }
 
 .card-top{ flex:1; }
 
 .card h3{
   margin:0;
-  font-size:16px;
-  font-weight:950;
-  letter-spacing:.15px;
+  font-size:15px;
+  font-weight:650;     /* nicht fett */
+  color:#334155;       /* nicht schwarz */
+  letter-spacing:.1px;
 }
 
 .card-desc{
-  margin-top:8px;
+  margin-top:6px;
   color:var(--muted);
-  font-weight:750;
+  font-weight:600;
   font-size:13px;
   line-height:1.35;
+  min-height: 18px;
 }
 
 .actions-row{
@@ -187,6 +182,7 @@ header img{ height:44px; }
   flex-wrap:wrap;
   gap:8px;
 }
+
 
 /* ===== Results Panel / Table ===== */
 .panel{
@@ -257,3 +253,24 @@ code.badge{
   gap:8px;
   align-items:center;
 }
+
+.chip{
+  display:inline-flex;
+  align-items:center;
+  padding:8px 12px;
+  border-radius:999px;
+  font-weight:700;
+  font-size:13px;
+  text-decoration:none;
+  border:1px solid rgba(2,132,199,.18);
+  background: rgba(14,165,233,.10);
+  color: var(--brand-ink);
+  transition: background .15s ease, border-color .15s ease, transform .05s ease;
+  user-select:none;
+}
+.chip:hover{
+  background: rgba(14,165,233,.14);
+  border-color: rgba(2,132,199,.28);
+}
+.chip:active{ transform: translateY(1px); }
+
