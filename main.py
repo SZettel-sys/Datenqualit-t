@@ -1555,24 +1555,6 @@ async def dq_first_name_invalidchars_db(after_id: int = 0, limit: int = 200):
     return HTMLResponse(page_shell("Vorname – Ungültige Zeichen", body))
 
 
-_person_labels_cache: Optional[dict[int, str]] = None
-
-async def get_person_labels(headers: dict) -> dict[int, str]:
-    global _person_labels_cache
-    if _person_labels_cache is not None:
-        return _person_labels_cache
-
-    url = "https://api.pipedrive.com/v1/personLabels"
-    async with httpx.AsyncClient(timeout=30.0) as client:
-        r = await client.get(url, headers=headers)
-        if r.status_code != 200:
-            _person_labels_cache = {}
-            return _person_labels_cache
-
-        data = (r.json() or {}).get("data") or []
-        _person_labels_cache = {int(x["id"]): (x.get("name") or "") for x in data if x.get("id") is not None}
-        return _person_labels_cache
-
 
 _field_options_cache: dict[str, list[tuple[str, str]]] = {}
 
@@ -2099,73 +2081,163 @@ async def dq_person_update_db(person_id: int, payload: dict = Body(...)):
 #
 #  ENDPUNKTE ORGANISATIONEN
 ########################################################################
-async def _dq_scan_orgs_missing(field_key: str) -> list[dict]:
-    headers = get_headers()
-    if not headers:
-        raise RuntimeError("Nicht eingeloggt")
-
-    orgs = await fetch_all_v2("organizations", headers=headers)
-    bad = []
-    for o in orgs:
-        v = o.get(field_key)
-        # address ist oft dict → missing, wenn value leer
-        if field_key == "address":
-            v = extract_address(v)
-        if _is_missing(v) or (isinstance(v, str) and v.strip() == "-"):
-            bad.append(
-                {
-                    "id": o.get("id"),
-                    "display_name": o.get("name") or "-",
-                    "current_value": _scalarize(o.get(field_key)) if field_key != "address" else extract_address(o.get(field_key)),
-                }
-            )
-    return bad
-
-
-async def _dq_scan_orgs_invalidchars(field_key: str) -> list[dict]:
-    headers = get_headers()
-    if not headers:
-        raise RuntimeError("Nicht eingeloggt")
-
-    orgs = await fetch_all_v2("organizations", headers=headers)
-    bad = []
-    for o in orgs:
-        v = _scalarize(o.get(field_key)).strip()
-        if not v:
-            continue
-        if _has_invalid_name_chars(v):
-            bad.append(
-                {
-                    "id": o.get("id"),
-                    "display_name": o.get("name") or "-",
-                    "current_value": v,
-                }
-            )
-    return bad
-
-
 @app.get("/dq/orgs/missing", response_class=HTMLResponse)
-async def dq_orgs_missing(field: str):
+async def dq_orgs_missing(field: str, after_id: int = 0, limit: int = 200):
     if "default" not in user_tokens:
         return RedirectResponse("/login")
+    if not db_pool:
+        return HTMLResponse("DB nicht initialisiert", status_code=500)
 
-    rows = await _dq_scan_orgs_missing(field)
-    title = "Organisationen – Fehlende Daten"
-    subtitle = f"Feld: {field}"
-    body = _render_results_table(title, subtitle, "organization", field, rows)
-    return HTMLResponse(page_shell(title, body))
+    limit = max(50, min(int(limit), 500))
+    if field not in ("name", "address", "website"):
+        return HTMLResponse("Ungültiges Feld", status_code=400)
+
+    sql = f"""
+    SELECT id, name, address, website
+    FROM orgs_cache
+    WHERE ({field} IS NULL OR btrim({field}) = '')
+      AND id > $1
+    ORDER BY id
+    LIMIT $2
+    """
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch(sql, after_id, limit)
+
+    trs = []
+    last_id = after_id
+    for r in rows:
+        oid = int(r["id"])
+        last_id = oid
+        name = (r["name"] or "").strip() or "-"
+        val = (r[field] or "").strip() if r.get(field) else ""
+        trs.append(f"""
+          <tr>
+            <td><code class="badge">{oid}</code></td>
+            <td>{html_escape(name)}</td>
+            <td>
+              <input class="field-input" id="inp_organization_{oid}_{field}" value="{html_escape(val)}" />
+              <div class="small">Aktueller Wert (editierbar)</div>
+            </td>
+            <td>
+              <button class="btn btn-primary" onclick="updateField('organization','{oid}','{field}')">Aktualisieren</button>
+            </td>
+          </tr>
+        """)
+
+    next_link = ""
+    if rows:
+        next_link = f'<a class="btn btn-outline" href="/dq/orgs/missing?field={field}&after_id={last_id}&limit={limit}">Weiter →</a>'
+
+    body = f"""
+      <div class="topbar">
+        <div>
+          <div class="title">Organisationen – Fehlende Daten</div>
+          <div class="subtitle">Feld: {html_escape(field)} · Liste aus Cache-DB · Page size: {limit}</div>
+        </div>
+        <div style="display:flex; gap:10px;">
+          <a class="btn btn-outline" href="/overview">← Zur Übersicht</a>
+          {next_link}
+        </div>
+      </div>
+
+      <div class="panel">
+        <table>
+          <thead>
+            <tr>
+              <th style="width:120px;">ID</th>
+              <th>Name</th>
+              <th>Wert</th>
+              <th style="width:180px;">Aktion</th>
+            </tr>
+          </thead>
+          <tbody>
+            {''.join(trs) if trs else '<tr><td colspan="4">✅ Keine Treffer.</td></tr>'}
+          </tbody>
+        </table>
+      </div>
+    """
+    return HTMLResponse(page_shell("Organisationen – Fehlende Daten", body))
 
 
 @app.get("/dq/orgs/invalidchars", response_class=HTMLResponse)
-async def dq_orgs_invalidchars(field: str):
+async def dq_orgs_invalidchars(field: str, after_id: int = 0, limit: int = 200):
     if "default" not in user_tokens:
         return RedirectResponse("/login")
+    if not db_pool:
+        return HTMLResponse("DB nicht initialisiert", status_code=500)
 
-    rows = await _dq_scan_orgs_invalidchars(field)
-    title = "Organisationen – Sonderzeichen / ungültige Zeichen"
-    subtitle = f"Feld: {field} (erlaubt: A–Z, Umlaute, Leerzeichen, - ')"
-    body = _render_results_table(title, subtitle, "organization", field, rows)
-    return HTMLResponse(page_shell(title, body))
+    limit = max(50, min(int(limit), 500))
+    if field != "name":
+        return HTMLResponse("Invalidchars ist nur für name sinnvoll", status_code=400)
+
+    pattern = r"^[A-Za-zÄÖÜäöüß\s\-']+$"
+
+    sql = """
+    SELECT id, name
+    FROM orgs_cache
+    WHERE name IS NOT NULL
+      AND btrim(name) <> ''
+      AND name !~ $1
+      AND id > $2
+    ORDER BY id
+    LIMIT $3
+    """
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch(sql, pattern, after_id, limit)
+
+    trs = []
+    last_id = after_id
+    for r in rows:
+        oid = int(r["id"])
+        last_id = oid
+        name = (r["name"] or "").strip() or "-"
+        trs.append(f"""
+          <tr>
+            <td><code class="badge">{oid}</code></td>
+            <td>{html_escape(name)}</td>
+            <td>
+              <input class="field-input" id="inp_organization_{oid}_name" value="{html_escape(name)}" />
+              <div class="small">Aktueller Wert (editierbar)</div>
+            </td>
+            <td>
+              <button class="btn btn-primary" onclick="updateField('organization','{oid}','name')">Aktualisieren</button>
+            </td>
+          </tr>
+        """)
+
+    next_link = ""
+    if rows:
+        next_link = f'<a class="btn btn-outline" href="/dq/orgs/invalidchars?field=name&after_id={last_id}&limit={limit}">Weiter →</a>'
+
+    body = f"""
+      <div class="topbar">
+        <div>
+          <div class="title">Organisationen – Ungültige Zeichen</div>
+          <div class="subtitle">Feld: name · Liste aus Cache-DB · Page size: {limit}</div>
+        </div>
+        <div style="display:flex; gap:10px;">
+          <a class="btn btn-outline" href="/overview">← Zur Übersicht</a>
+          {next_link}
+        </div>
+      </div>
+
+      <div class="panel">
+        <table>
+          <thead>
+            <tr>
+              <th style="width:120px;">ID</th>
+              <th>Name</th>
+              <th>Wert</th>
+              <th style="width:180px;">Aktion</th>
+            </tr>
+          </thead>
+          <tbody>
+            {''.join(trs) if trs else '<tr><td colspan="4">✅ Keine Treffer.</td></tr>'}
+          </tbody>
+        </table>
+      </div>
+    """
+    return HTMLResponse(page_shell("Organisationen – Ungültige Zeichen", body))
 
 
 ########################################################################
@@ -2175,15 +2247,6 @@ async def dq_orgs_invalidchars(field: str):
 ########################################################################
 @app.post("/dq/update")
 async def dq_update(payload: dict = Body(...)):
-    """
-    Body:
-    {
-      "entity_type": "person" | "organization",
-      "entity_id": 123,
-      "field_key": "...",
-      "value": "..."
-    }
-    """
     if "default" not in user_tokens:
         return JSONResponse({"ok": False, "error": "Nicht eingeloggt"}, status_code=401)
 
@@ -2205,8 +2268,16 @@ async def dq_update(payload: dict = Body(...)):
 
     entity_endpoint = "persons" if entity_type == "person" else "organizations"
 
-    # v2 payload bauen
-    patch_fragment = normalize_person_update_payload_v2(field_key, value)
+    # ✅ Patch-Payload korrekt je Entity bauen
+    if entity_type == "person":
+        patch_fragment = normalize_person_update_payload_v2(field_key, value)
+    else:
+        # organizations: nur Root-Felder zulassen
+        if field_key not in ("name", "address", "website"):
+            return {"ok": False, "error": "organization erlaubt nur: name, address, website"}
+
+        v = (value or "").strip()
+        patch_fragment = {field_key: (v if v else None)}
 
     try:
         result = await pipedrive_patch_v2(entity_endpoint, entity_id, patch_fragment, headers)
