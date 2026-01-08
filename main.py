@@ -91,15 +91,17 @@ async def init_db():
 
         await conn.execute("""
         CREATE TABLE IF NOT EXISTS sync_state (
-          entity TEXT PRIMARY KEY,              -- 'persons' | 'organizations'
+          entity TEXT PRIMARY KEY,
           last_update_time TIMESTAMPTZ NOT NULL
         );
         """)
+
+        # Erweiterungen (safe)
+        await conn.execute("ALTER TABLE persons_cache ADD COLUMN IF NOT EXISTS label_ids BIGINT[];")
         await conn.execute("ALTER TABLE sync_state ADD COLUMN IF NOT EXISTS last_cursor TEXT;")
         await conn.execute("ALTER TABLE sync_state ADD COLUMN IF NOT EXISTS full_in_progress BOOLEAN NOT NULL DEFAULT FALSE;")
 
-
-        # Indizes für schnelle "Vorname fehlt" Queries + Join
+        # Indizes
         await conn.execute("""
         CREATE INDEX IF NOT EXISTS idx_persons_missing_first_name
         ON persons_cache (id)
@@ -115,6 +117,7 @@ async def init_db():
         CREATE INDEX IF NOT EXISTS idx_orgs_name
         ON orgs_cache (name);
         """)
+
 
 async def get_sync_time(entity: str) -> datetime:
     async with db_pool.acquire() as conn:
@@ -136,6 +139,24 @@ async def set_sync_time(entity: str, t: datetime):
             VALUES($1, $2)
             ON CONFLICT(entity) DO UPDATE SET last_update_time=EXCLUDED.last_update_time
         """, entity, t)
+
+
+async def get_sync_cursor(entity: str) -> tuple[Optional[str], bool]:
+    async with db_pool.acquire() as conn:
+        row = await conn.fetchrow("SELECT last_cursor, full_in_progress FROM sync_state WHERE entity=$1", entity)
+        if not row:
+            return None, False
+        return row["last_cursor"], bool(row["full_in_progress"])
+
+
+async def set_sync_cursor(entity: str, cursor: Optional[str], in_progress: bool):
+    async with db_pool.acquire() as conn:
+        await conn.execute("""
+            UPDATE sync_state
+            SET last_cursor=$2, full_in_progress=$3
+            WHERE entity=$1
+        """, entity, cursor, in_progress)
+
 
 async def get_sync_cursor(entity: str) -> tuple[Optional[str], bool]:
     async with db_pool.acquire() as conn:
@@ -256,16 +277,18 @@ TITLE_PREFIX_REGEX = re.compile(
 
 DQ_CARDS = [
     # ================= Kontakte =================
+  
     {
         "group": "Kontakte",
         "title": "Vorname",
         "description": "",
         "actions": [
             {"label": "Fehlende Daten", "href": "/dq/contacts/first_name/missing"},
-            {"label": "Ungültige Zeichen", "href": "/dq/contacts/invalidchars?field=first_name"},
+            {"label": "Ungültige Zeichen", "href": "/dq/contacts/first_name/invalidchars"},
             {"label": "Titel im Vornamen", "href": "/dq/contacts/title_in_first_name"},
         ],
     },
+
     {
         "group": "Kontakte",
         "title": "Nachname",
@@ -503,6 +526,22 @@ def _email_first(p: dict) -> str:
     return val.split(",")[0].strip()
 
 
+def _label_ids_list(p: dict) -> list[int]:
+    v = p.get("label_ids")
+    if not v:
+        return []
+    if isinstance(v, list):
+        out = []
+        for x in v:
+            try:
+                out.append(int(x))
+            except Exception:
+                pass
+        return out
+    return []
+
+
+
 async def upsert_persons(batch: list[dict]) -> Optional[datetime]:
     if not batch:
         return None
@@ -529,7 +568,8 @@ async def upsert_persons(batch: list[dict]) -> Optional[datetime]:
             _scalarize(p.get(PD_PERSON_POSITION_KEY)).strip(),
             _scalarize(p.get(PD_PERSON_LINKEDIN_KEY)).strip(),
             _get_org_id_from_person(p),
-            ts
+            ts,
+            _label_ids_list(p),
         ))
 
     if not rows:
@@ -537,9 +577,9 @@ async def upsert_persons(batch: list[dict]) -> Optional[datetime]:
 
     sql = """
     INSERT INTO persons_cache
-      (id, first_name, last_name, gender, email, du_sie, position, linkedin_url, org_id, update_time)
+      (id, first_name, last_name, gender, email, du_sie, position, linkedin_url, org_id, update_time, label_ids)
     VALUES
-      ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+      ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
     ON CONFLICT (id) DO UPDATE SET
       first_name   = EXCLUDED.first_name,
       last_name    = EXCLUDED.last_name,
@@ -549,7 +589,8 @@ async def upsert_persons(batch: list[dict]) -> Optional[datetime]:
       position     = EXCLUDED.position,
       linkedin_url = EXCLUDED.linkedin_url,
       org_id       = EXCLUDED.org_id,
-      update_time  = COALESCE(EXCLUDED.update_time, persons_cache.update_time)
+      update_time  = COALESCE(EXCLUDED.update_time, persons_cache.update_time),
+      label_ids    = EXCLUDED.label_ids
     """
 
     async with db_pool.acquire() as conn:
@@ -1094,7 +1135,7 @@ async def db_fetch_person_detail(person_id: int) -> dict:
     sql = """
     SELECT
       p.id, p.first_name, p.last_name, p.gender, p.email, p.du_sie, p.position, p.linkedin_url,
-      p.org_id,
+      p.org_id, p.label_ids,
       COALESCE(o.name, '-') AS org_name
     FROM persons_cache p
     LEFT JOIN orgs_cache o ON o.id = p.org_id
@@ -1108,7 +1149,13 @@ async def db_fetch_person_detail(person_id: int) -> dict:
 async def db_update_person_cache(person_id: int, data: dict):
     sql = """
     UPDATE persons_cache SET
-      first_name=$2, last_name=$3, gender=$4, email=$5, du_sie=$6, position=$7, linkedin_url=$8,
+      first_name=$2,
+      last_name=$3,
+      gender=$4,
+      email=$5,
+      du_sie=$6,
+      position=$7,
+      linkedin_url=$8,
       update_time=$9
     WHERE id=$1
     """
@@ -1116,15 +1163,16 @@ async def db_update_person_cache(person_id: int, data: dict):
         await conn.execute(
             sql,
             person_id,
-            data.get("first_name"),
-            data.get("last_name"),
-            data.get("gender"),
-            data.get("email"),
-            data.get("du_sie"),
-            data.get("position"),
-            data.get("linkedin_url"),
+            data.get("first_name") or "",
+            data.get("last_name") or "",
+            data.get("gender") or "",
+            data.get("email") or "",
+            data.get("du_sie") or "",
+            data.get("position") or "",
+            data.get("linkedin_url") or "",
             _utcnow()
         )
+
 
 
 @app.get("/dq/contacts/first_name/missing", response_class=HTMLResponse)
@@ -1135,19 +1183,30 @@ async def dq_first_name_missing_db(after_id: int = 0, limit: int = 200):
         return HTMLResponse("DB nicht initialisiert (DATABASE_URL fehlt)", status_code=500)
 
     limit = max(50, min(int(limit), 500))
-    rows = await db_fetch_missing_first_name(after_id=after_id, limit=limit)
+
+    sql = """
+    SELECT id, first_name, last_name
+    FROM persons_cache
+    WHERE (first_name IS NULL OR btrim(first_name) = '')
+      AND id > $1
+    ORDER BY id
+    LIMIT $2
+    """
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch(sql, after_id, limit)
 
     trs = []
     last_id = after_id
     for r in rows:
-        pid = r["id"]
+        pid = int(r["id"])
         last_id = pid
-        display = (f"{(r.get('first_name') or '').strip()} {(r.get('last_name') or '').strip()}").strip() or "-"
+        fn = (r["first_name"] or "").strip() or "-"
+        ln = (r["last_name"] or "").strip() or "-"
         trs.append(f"""
           <tr>
             <td><code class="badge">{pid}</code></td>
-            <td>{html_escape(display)}</td>
-            <td>{html_escape((r.get("email") or "").strip() or "-")}</td>
+            <td>{html_escape(fn)}</td>
+            <td>{html_escape(ln)}</td>
             <td style="width:160px;"><a class="chip" href="/dq/contacts/person/{pid}">Öffnen</a></td>
           </tr>
         """)
@@ -1173,8 +1232,8 @@ async def dq_first_name_missing_db(after_id: int = 0, limit: int = 200):
           <thead>
             <tr>
               <th style="width:120px;">ID</th>
-              <th>Kontakt</th>
-              <th>E-Mail</th>
+              <th>Vorname</th>
+              <th>Nachname</th>
               <th style="width:160px;">Aktion</th>
             </tr>
           </thead>
@@ -1187,6 +1246,129 @@ async def dq_first_name_missing_db(after_id: int = 0, limit: int = 200):
     return HTMLResponse(page_shell("Vorname – Fehlende Daten", body))
 
 
+@app.get("/dq/contacts/first_name/invalidchars", response_class=HTMLResponse)
+async def dq_first_name_invalidchars_db(after_id: int = 0, limit: int = 200):
+    if "default" not in user_tokens:
+        return RedirectResponse("/login")
+    if not db_pool:
+        return HTMLResponse("DB nicht initialisiert", status_code=500)
+
+    limit = max(50, min(int(limit), 500))
+
+    # Postgres regex: erlaubt A-Z, Umlaute, Leerzeichen, - und '
+    pattern = r"^[A-Za-zÄÖÜäöüß\s\-']+$"
+
+    sql = """
+    SELECT id, first_name, last_name
+    FROM persons_cache
+    WHERE first_name IS NOT NULL
+      AND btrim(first_name) <> ''
+      AND first_name !~ $1
+      AND id > $2
+    ORDER BY id
+    LIMIT $3
+    """
+
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch(sql, pattern, after_id, limit)
+
+    trs = []
+    last_id = after_id
+    for r in rows:
+        pid = int(r["id"])
+        last_id = pid
+        fn = (r["first_name"] or "").strip() or "-"
+        ln = (r["last_name"] or "").strip() or "-"
+        trs.append(f"""
+          <tr>
+            <td><code class="badge">{pid}</code></td>
+            <td>{html_escape(fn)}</td>
+            <td>{html_escape(ln)}</td>
+            <td style="width:160px;"><a class="chip" href="/dq/contacts/person/{pid}">Öffnen</a></td>
+          </tr>
+        """)
+
+    next_link = ""
+    if rows:
+        next_link = f'<a class="btn btn-outline" href="/dq/contacts/first_name/invalidchars?after_id={last_id}&limit={limit}">Weiter →</a>'
+
+    body = f"""
+      <div class="topbar">
+        <div>
+          <div class="title">Vorname – Ungültige Zeichen</div>
+          <div class="subtitle">Liste aus Cache-DB · Page size: {limit}</div>
+        </div>
+        <div style="display:flex; gap:10px;">
+          <a class="btn btn-outline" href="/overview">← Zur Übersicht</a>
+          {next_link}
+        </div>
+      </div>
+
+      <div class="panel">
+        <table>
+          <thead>
+            <tr>
+              <th style="width:120px;">ID</th>
+              <th>Vorname</th>
+              <th>Nachname</th>
+              <th style="width:160px;">Aktion</th>
+            </tr>
+          </thead>
+          <tbody>
+            {''.join(trs) if trs else '<tr><td colspan="4">✅ Keine Treffer.</td></tr>'}
+          </tbody>
+        </table>
+      </div>
+    """
+    return HTMLResponse(page_shell("Vorname – Ungültige Zeichen", body))
+
+
+_person_labels_cache: Optional[dict[int, str]] = None
+
+async def get_person_labels(headers: dict) -> dict[int, str]:
+    global _person_labels_cache
+    if _person_labels_cache is not None:
+        return _person_labels_cache
+
+    url = "https://api.pipedrive.com/v1/personLabels"
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        r = await client.get(url, headers=headers)
+        if r.status_code != 200:
+            _person_labels_cache = {}
+            return _person_labels_cache
+
+        data = (r.json() or {}).get("data") or []
+        _person_labels_cache = {int(x["id"]): (x.get("name") or "") for x in data if x.get("id") is not None}
+        return _person_labels_cache
+
+
+_field_options_cache: dict[str, list[tuple[str, str]]] = {}
+
+async def get_person_field_options(headers: dict, field_key: str) -> list[tuple[str, str]]:
+    if field_key in _field_options_cache:
+        return _field_options_cache[field_key]
+
+    url = "https://api.pipedrive.com/v1/personFields"
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        r = await client.get(url, headers=headers)
+        if r.status_code != 200:
+            _field_options_cache[field_key] = []
+            return []
+
+        fields = (r.json() or {}).get("data") or []
+        opts: list[tuple[str, str]] = []
+        for f in fields:
+            if f.get("key") == field_key:
+                for o in (f.get("options") or []):
+                    oid = o.get("id")
+                    label = o.get("label") or o.get("name") or ""
+                    if oid is not None and label:
+                        opts.append((str(oid), str(label)))
+                break
+
+        _field_options_cache[field_key] = opts
+        return opts
+
 @app.get("/dq/contacts/person/{person_id}", response_class=HTMLResponse)
 async def dq_person_detail_db(person_id: int, saved: int = 0):
     if "default" not in user_tokens:
@@ -1198,12 +1380,37 @@ async def dq_person_detail_db(person_id: int, saved: int = 0):
     if not p:
         return HTMLResponse("Kontakt nicht im Cache gefunden. Bitte Sync laufen lassen.", status_code=404)
 
+    headers = get_headers()
+
+    gender_opts = await get_person_field_options(headers, PD_PERSON_GENDER_KEY)
+    du_opts = await get_person_field_options(headers, PD_PERSON_DU_SIE_KEY)
+
+    labels_map = await get_person_labels(headers)
+    label_ids = p.get("label_ids") or []
+    if label_ids and not isinstance(label_ids, list):
+        label_ids = []
+    label_names = []
+    for x in label_ids:
+        try:
+            label_names.append(labels_map.get(int(x), str(x)))
+        except Exception:
+            pass
+    labels_text = ", ".join([x for x in label_names if x]) or "-"
+
     notice = ""
     if saved == 1:
         notice = '<div class="panel" style="margin-bottom:12px; border-color: rgba(14,165,233,.35);">✅ Gespeichert.</div>'
 
     def val(k: str) -> str:
         return html_escape((p.get(k) or "").strip())
+
+    def select_html(select_id: str, current: str, options: list[tuple[str, str]]) -> str:
+        cur = (current or "").strip()
+        opts_html = ['<option value="">– bitte wählen –</option>']
+        for v, lab in options:
+            sel = " selected" if v == cur else ""
+            opts_html.append(f'<option value="{html_escape(v)}"{sel}>{html_escape(lab)}</option>')
+        return f'<select class="field-input" id="{select_id}">{"".join(opts_html)}</select>'
 
     body = f"""
       <div class="topbar">
@@ -1224,11 +1431,15 @@ async def dq_person_detail_db(person_id: int, saved: int = 0):
           <tbody>
             <tr><th style="width:240px;">Vorname</th><td><input class="field-input" id="first_name" value="{val("first_name")}" /></td></tr>
             <tr><th>Nachname</th><td><input class="field-input" id="last_name" value="{val("last_name")}" /></td></tr>
-            <tr><th>Geschlecht</th><td><input class="field-input" id="gender" value="{val("gender")}" /></td></tr>
+
+            <tr><th>Geschlecht</th><td>{select_html("gender", p.get("gender") or "", gender_opts)}</td></tr>
             <tr><th>E-Mail-Adresse</th><td><input class="field-input" id="email" value="{val("email")}" /></td></tr>
-            <tr><th>Du oder Sie</th><td><input class="field-input" id="du_sie" value="{val("du_sie")}" /></td></tr>
+            <tr><th>Du oder Sie</th><td>{select_html("du_sie", p.get("du_sie") or "", du_opts)}</td></tr>
+
             <tr><th>Position</th><td><input class="field-input" id="position" value="{val("position")}" /></td></tr>
             <tr><th>LinkedIn-URL</th><td><input class="field-input" id="linkedin_url" value="{val("linkedin_url")}" /></td></tr>
+
+            <tr><th>Labels</th><td><input class="field-input" value="{html_escape(labels_text)}" disabled /></td></tr>
             <tr><th>Organisation</th><td><input class="field-input" value="{html_escape(p.get("org_name") or "-")}" disabled /></td></tr>
           </tbody>
         </table>
@@ -1256,11 +1467,13 @@ async def dq_person_detail_db(person_id: int, saved: int = 0):
             body: JSON.stringify(payload)
           }});
 
-          const data = await res.json();
-          if(data.ok) {{
+          let data = null;
+          try {{ data = await res.json(); }} catch(e) {{}}
+
+          if(res.ok && data && data.ok) {{
             window.location.href = `/dq/contacts/person/${{personId}}?saved=1`;
           }} else {{
-            alert("❌ Fehler: " + (data.error || "Unbekannt"));
+            alert("❌ Fehler: " + ((data && data.error) ? data.error : ("HTTP " + res.status)));
           }}
         }}
       </script>
@@ -1275,7 +1488,6 @@ async def dq_person_update_db(person_id: int, payload: dict = Body(...)):
 
     headers = get_headers()
 
-    # Mapping: Cache-Feldnamen -> Pipedrive-Feldkeys
     pd_payload = {
         "first_name": (payload.get("first_name") or "").strip(),
         "last_name": (payload.get("last_name") or "").strip(),
@@ -1291,7 +1503,6 @@ async def dq_person_update_db(person_id: int, payload: dict = Body(...)):
     try:
         await pipedrive_update_v2("persons", person_id, pd_payload, headers)
 
-        # Cache aktualisieren (ohne extra GET)
         if db_pool:
             await db_update_person_cache(person_id, {
                 "first_name": pd_payload["first_name"],
@@ -1303,9 +1514,10 @@ async def dq_person_update_db(person_id: int, payload: dict = Body(...)):
                 "linkedin_url": pd_payload[PD_PERSON_LINKEDIN_KEY],
             })
 
-        return {"ok": True}
+        return JSONResponse({"ok": True})
     except Exception as e:
-        return {"ok": False, "error": str(e)}
+        return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
+
 
 ########################################################################
 #
