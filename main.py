@@ -77,7 +77,8 @@ async def init_db():
           position TEXT,
           linkedin_url TEXT,
           org_id BIGINT,
-          update_time TIMESTAMPTZ
+          update_time TIMESTAMPTZ,
+          label_ids BIGINT[]
         );
         """)
 
@@ -85,6 +86,8 @@ async def init_db():
         CREATE TABLE IF NOT EXISTS orgs_cache (
           id BIGINT PRIMARY KEY,
           name TEXT,
+          address TEXT,
+          website TEXT,
           update_time TIMESTAMPTZ
         );
         """)
@@ -92,16 +95,13 @@ async def init_db():
         await conn.execute("""
         CREATE TABLE IF NOT EXISTS sync_state (
           entity TEXT PRIMARY KEY,
-          last_update_time TIMESTAMPTZ NOT NULL
+          last_update_time TIMESTAMPTZ NOT NULL,
+          last_cursor TEXT,
+          full_in_progress BOOLEAN NOT NULL DEFAULT FALSE
         );
         """)
 
-        # Erweiterungen (safe)
-        await conn.execute("ALTER TABLE persons_cache ADD COLUMN IF NOT EXISTS label_ids BIGINT[];")
-        await conn.execute("ALTER TABLE sync_state ADD COLUMN IF NOT EXISTS last_cursor TEXT;")
-        await conn.execute("ALTER TABLE sync_state ADD COLUMN IF NOT EXISTS full_in_progress BOOLEAN NOT NULL DEFAULT FALSE;")
-
-        # Indizes
+        # Personen-Indizes (schnell für DQ-Listen)
         await conn.execute("""
         CREATE INDEX IF NOT EXISTS idx_persons_missing_first_name
         ON persons_cache (id)
@@ -109,10 +109,47 @@ async def init_db():
         """)
 
         await conn.execute("""
+        CREATE INDEX IF NOT EXISTS idx_persons_missing_last_name
+        ON persons_cache (id)
+        WHERE (last_name IS NULL OR btrim(last_name) = '');
+        """)
+
+        await conn.execute("""
+        CREATE INDEX IF NOT EXISTS idx_persons_missing_email
+        ON persons_cache (id)
+        WHERE (email IS NULL OR btrim(email) = '');
+        """)
+
+        await conn.execute("""
+        CREATE INDEX IF NOT EXISTS idx_persons_missing_gender
+        ON persons_cache (id)
+        WHERE (gender IS NULL OR btrim(gender) = '');
+        """)
+
+        await conn.execute("""
+        CREATE INDEX IF NOT EXISTS idx_persons_missing_du_sie
+        ON persons_cache (id)
+        WHERE (du_sie IS NULL OR btrim(du_sie) = '');
+        """)
+
+        await conn.execute("""
+        CREATE INDEX IF NOT EXISTS idx_persons_missing_position
+        ON persons_cache (id)
+        WHERE (position IS NULL OR btrim(position) = '');
+        """)
+
+        await conn.execute("""
+        CREATE INDEX IF NOT EXISTS idx_persons_missing_linkedin
+        ON persons_cache (id)
+        WHERE (linkedin_url IS NULL OR btrim(linkedin_url) = '');
+        """)
+
+        await conn.execute("""
         CREATE INDEX IF NOT EXISTS idx_persons_org_id
         ON persons_cache (org_id);
         """)
 
+        # Org-Indizes
         await conn.execute("""
         CREATE INDEX IF NOT EXISTS idx_orgs_name
         ON orgs_cache (name);
@@ -259,9 +296,8 @@ TITLE_PREFIX_REGEX = re.compile(
     re.IGNORECASE,
 )
 
+
 DQ_CARDS = [
-    # ================= Kontakte =================
-  
     {
         "group": "Kontakte",
         "title": "Vorname",
@@ -269,17 +305,16 @@ DQ_CARDS = [
         "actions": [
             {"label": "Fehlende Daten", "href": "/dq/contacts/first_name/missing"},
             {"label": "Ungültige Zeichen", "href": "/dq/contacts/first_name/invalidchars"},
-            {"label": "Titel im Vornamen", "href": "/dq/contacts/title_in_first_name"},
+            {"label": "Titel im Vornamen", "href": "/dq/contacts/first_name/title"},
         ],
     },
-
     {
         "group": "Kontakte",
         "title": "Nachname",
         "description": "",
         "actions": [
-            {"label": "Fehlende Daten", "href": "/dq/contacts/missing?field=last_name"},
-            {"label": "Ungültige Zeichen", "href": "/dq/contacts/invalidchars?field=last_name"},
+            {"label": "Fehlende Daten", "href": "/dq/contacts/last_name/missing"},
+            {"label": "Ungültige Zeichen", "href": "/dq/contacts/last_name/invalidchars"},
         ],
     },
     {
@@ -287,7 +322,7 @@ DQ_CARDS = [
         "title": "Geschlecht",
         "description": "",
         "actions": [
-            {"label": "Fehlende Daten", "href": f"/dq/contacts/missing?field={PD_PERSON_GENDER_KEY}"},
+            {"label": "Fehlende Daten", "href": "/dq/contacts/gender/missing"},
         ],
     },
     {
@@ -295,7 +330,7 @@ DQ_CARDS = [
         "title": "E-Mail-Adresse",
         "description": "",
         "actions": [
-            {"label": "Fehlende Daten", "href": "/dq/contacts/missing?field=emails"},
+            {"label": "Fehlende Daten", "href": "/dq/contacts/email/missing"},
         ],
     },
     {
@@ -303,7 +338,7 @@ DQ_CARDS = [
         "title": "Du oder Sie",
         "description": "",
         "actions": [
-            {"label": "Fehlende Daten", "href": f"/dq/contacts/missing?field={PD_PERSON_DU_SIE_KEY}"},
+            {"label": "Fehlende Daten", "href": "/dq/contacts/du_sie/missing"},
         ],
     },
     {
@@ -311,7 +346,7 @@ DQ_CARDS = [
         "title": "Position",
         "description": "",
         "actions": [
-            {"label": "Fehlende Daten", "href": f"/dq/contacts/missing?field={PD_PERSON_POSITION_KEY}"},
+            {"label": "Fehlende Daten", "href": "/dq/contacts/position/missing"},
         ],
     },
     {
@@ -319,18 +354,18 @@ DQ_CARDS = [
         "title": "LinkedIn-URL",
         "description": "",
         "actions": [
-            {"label": "Fehlende Daten", "href": f"/dq/contacts/missing?field={PD_PERSON_LINKEDIN_KEY}"},
+            {"label": "Fehlende Daten", "href": "/dq/contacts/linkedin/missing"},
         ],
     },
 
-    # ================= Organisationen =================
+    # Orgs bleiben vorerst, aber siehe Punkt 3 (Org-Cache erweitern!)
     {
         "group": "Organisationen",
         "title": "Name / Rechtsform",
         "description": "",
         "actions": [
-            {"label": "Fehlende Daten", "href": f"/dq/orgs/missing?field={PD_ORG_NAME_KEY}"},
-            {"label": "Ungültige Zeichen", "href": f"/dq/orgs/invalidchars?field={PD_ORG_NAME_KEY}"},
+            {"label": "Fehlende Daten", "href": "/dq/orgs/missing?field=name"},
+            {"label": "Ungültige Zeichen", "href": "/dq/orgs/invalidchars?field=name"},
         ],
     },
     {
@@ -338,7 +373,7 @@ DQ_CARDS = [
         "title": "Adresse",
         "description": "",
         "actions": [
-            {"label": "Fehlende Daten", "href": f"/dq/orgs/missing?field={PD_ORG_ADDRESS_KEY}"},
+            {"label": "Fehlende Daten", "href": "/dq/orgs/missing?field=address"},
         ],
     },
     {
@@ -346,12 +381,10 @@ DQ_CARDS = [
         "title": "Website",
         "description": "",
         "actions": [
-            {"label": "Fehlende Daten", "href": f"/dq/orgs/missing?field={PD_ORG_WEBSITE_KEY}"},
+            {"label": "Fehlende Daten", "href": "/dq/orgs/missing?field=website"},
         ],
     },
 ]
-
-
 
 ########################################################################
 #
@@ -674,7 +707,6 @@ async def upsert_persons(batch: list[dict]) -> Optional[datetime]:
 
     return max_ts
 
-
 async def upsert_orgs(batch: list[dict]) -> Optional[datetime]:
     if not batch:
         return None
@@ -691,9 +723,14 @@ async def upsert_orgs(batch: list[dict]) -> Optional[datetime]:
         if ts and (max_ts is None or ts > max_ts):
             max_ts = ts
 
+        addr = extract_address(o.get("address"))
+        web = _scalarize(o.get("website")).strip()
+
         rows.append((
             int(oid),
             _scalarize(o.get("name")).strip(),
+            (addr if addr != "-" else ""),
+            web,
             ts
         ))
 
@@ -701,10 +738,12 @@ async def upsert_orgs(batch: list[dict]) -> Optional[datetime]:
         return max_ts
 
     sql = """
-    INSERT INTO orgs_cache (id, name, update_time)
-    VALUES ($1,$2,$3)
+    INSERT INTO orgs_cache (id, name, address, website, update_time)
+    VALUES ($1,$2,$3,$4,$5)
     ON CONFLICT (id) DO UPDATE SET
       name        = EXCLUDED.name,
+      address     = EXCLUDED.address,
+      website     = EXCLUDED.website,
       update_time = COALESCE(EXCLUDED.update_time, orgs_cache.update_time)
     """
 
@@ -712,6 +751,7 @@ async def upsert_orgs(batch: list[dict]) -> Optional[datetime]:
         await conn.executemany(sql, rows)
 
     return max_ts
+
 
 async def sync_persons_incremental(full: bool = False, max_pages: int = 20) -> dict:
     headers = get_headers()
@@ -1286,88 +1326,6 @@ def logout():
 #
 ########################################################################
 
-async def _dq_scan_contacts_missing(field_key: str) -> list[dict]:
-    headers = get_headers()
-    if not headers:
-        raise RuntimeError("Nicht eingeloggt")
-
-    # Nur die Custom Fields laden, die wir wirklich brauchen (max 15) :contentReference[oaicite:8]{index=8}
-    needed_custom_fields = [
-        PD_PERSON_GENDER_KEY,
-        PD_PERSON_DU_SIE_KEY,
-        PD_PERSON_POSITION_KEY,
-        PD_PERSON_LINKEDIN_KEY,
-    ]
-
-    params = {}
-    # nur setzen, wenn field_key selbst ein custom field ist oder wir allgemein die UI Felder brauchen
-    if field_key in needed_custom_fields:
-        params["custom_fields"] = ",".join(needed_custom_fields)
-    else:
-        # trotzdem sinnvoll: wir lassen es leer, um Response klein zu halten
-        pass
-
-    persons = await fetch_all_v2("persons", headers=headers, params=params)
-
-    bad = []
-    for p in persons:
-        v = pd_get_value_v2(p, field_key)
-        if _is_missing(v):
-            bad.append(
-                {
-                    "id": p.get("id"),
-                    "first_name": _scalarize(pd_get_value_v2(p, "first_name")),
-                    "last_name": _scalarize(pd_get_value_v2(p, "last_name")),
-                }
-            )
-    return bad
-
-
-
-async def _dq_scan_contacts_invalidchars(field_key: str) -> list[dict]:
-    headers = get_headers()
-    if not headers:
-        raise RuntimeError("Nicht eingeloggt")
-
-    # first_name / last_name sind Root-Felder → keine custom_fields nötig
-    persons = await fetch_all_v2("persons", headers=headers, params={"limit": 500})
-
-    bad = []
-    for p in persons:
-        v = _scalarize(pd_get_value_v2(p, field_key)).strip()
-        if not v:
-            continue
-        if _has_invalid_name_chars(v):
-            bad.append(
-                {
-                    "id": p.get("id"),
-                    "first_name": _scalarize(pd_get_value_v2(p, "first_name")),
-                    "last_name": _scalarize(pd_get_value_v2(p, "last_name")),
-                }
-            )
-    return bad
-
-async def _dq_scan_contacts_title_in_first_name() -> list[dict]:
-    headers = get_headers()
-    if not headers:
-        raise RuntimeError("Nicht eingeloggt")
-
-    persons = await fetch_all_v2("persons", headers=headers, params={"limit": 500})
-
-    bad = []
-    for p in persons:
-        v = _scalarize(pd_get_value_v2(p, "first_name")).strip()
-        if not v:
-            continue
-        if TITLE_PREFIX_REGEX.search(v):
-            bad.append(
-                {
-                    "id": p.get("id"),
-                    "first_name": _scalarize(pd_get_value_v2(p, "first_name")),
-                    "last_name": _scalarize(pd_get_value_v2(p, "last_name")),
-                }
-            )
-    return bad
 
 async def pipedrive_patch_v2(entity: str, entity_id: int, payload: dict, headers: dict) -> dict:
     """
@@ -1460,41 +1418,6 @@ def html_escape(s: str) -> str:
         .replace("'", "&#39;")
     )
 
-
-@app.get("/dq/contacts/missing", response_class=HTMLResponse)
-async def dq_contacts_missing(field: str):
-    if "default" not in user_tokens:
-        return RedirectResponse("/login")
-
-    rows = await _dq_scan_contacts_missing(field)
-    title = "Kontakte – Fehlende Daten"
-    subtitle = f"Feld: {field}"
-    body = _render_results_table(title, subtitle, "person", field, rows)
-    return HTMLResponse(page_shell(title, body))
-
-
-@app.get("/dq/contacts/invalidchars", response_class=HTMLResponse)
-async def dq_contacts_invalidchars(field: str):
-    if "default" not in user_tokens:
-        return RedirectResponse("/login")
-
-    rows = await _dq_scan_contacts_invalidchars(field)
-    title = "Kontakte – Sonderzeichen / ungültige Zeichen"
-    subtitle = f"Feld: {field} (erlaubt: A–Z, Umlaute, Leerzeichen, - ')"
-    body = _render_results_table(title, subtitle, "person", field, rows)
-    return HTMLResponse(page_shell(title, body))
-
-
-@app.get("/dq/contacts/title_in_first_name", response_class=HTMLResponse)
-async def dq_contacts_title_in_first_name():
-    if "default" not in user_tokens:
-        return RedirectResponse("/login")
-
-    rows = await _dq_scan_contacts_title_in_first_name()
-    title = "Kontakte – Titel im Vornamen"
-    subtitle = "Prüfung: Dr./Prof./Herr/Frau etc. im Feld first_name"
-    body = _render_results_table(title, subtitle, "person", "first_name", rows)
-    return HTMLResponse(page_shell(title, body))
 
 async def db_fetch_missing_first_name(after_id: int = 0, limit: int = 200) -> list[dict]:
     sql = """
@@ -1696,21 +1619,13 @@ async def dq_person_detail_db(person_id: int, saved: int = 0):
         return HTMLResponse("Kontakt nicht im Cache gefunden. Bitte Sync laufen lassen.", status_code=404)
 
     headers = get_headers()
-
     gender_opts = await get_person_field_options(headers, PD_PERSON_GENDER_KEY)
     du_opts = await get_person_field_options(headers, PD_PERSON_DU_SIE_KEY)
 
-    labels_map = await get_person_labels(headers)
     label_ids = p.get("label_ids") or []
-    if label_ids and not isinstance(label_ids, list):
+    if not isinstance(label_ids, list):
         label_ids = []
-    label_names = []
-    for x in label_ids:
-        try:
-            label_names.append(labels_map.get(int(x), str(x)))
-        except Exception:
-            pass
-    labels_text = ", ".join([x for x in label_names if x]) or "-"
+    labels_text = ", ".join(str(x) for x in label_ids) if label_ids else "-"
 
     notice = ""
     if saved == 1:
@@ -1754,7 +1669,7 @@ async def dq_person_detail_db(person_id: int, saved: int = 0):
             <tr><th>Position</th><td><input class="field-input" id="position" value="{val("position")}" /></td></tr>
             <tr><th>LinkedIn-URL</th><td><input class="field-input" id="linkedin_url" value="{val("linkedin_url")}" /></td></tr>
 
-            <tr><th>Labels</th><td><input class="field-input" value="{html_escape(labels_text)}" disabled /></td></tr>
+            <tr><th>Labels (IDs)</th><td><input class="field-input" value="{html_escape(labels_text)}" disabled /></td></tr>
             <tr><th>Organisation</th><td><input class="field-input" value="{html_escape(p.get("org_name") or "-")}" disabled /></td></tr>
           </tbody>
         </table>
@@ -1794,6 +1709,335 @@ async def dq_person_detail_db(person_id: int, saved: int = 0):
       </script>
     """
     return HTMLResponse(page_shell("Kontakt bearbeiten", body))
+
+@app.get("/dq/contacts/last_name/missing", response_class=HTMLResponse)
+async def dq_last_name_missing_db(after_id: int = 0, limit: int = 200):
+    if "default" not in user_tokens:
+        return RedirectResponse("/login")
+    if not db_pool:
+        return HTMLResponse("DB nicht initialisiert", status_code=500)
+
+    limit = max(50, min(int(limit), 500))
+
+    sql = """
+    SELECT id, first_name, last_name
+    FROM persons_cache
+    WHERE (last_name IS NULL OR btrim(last_name) = '')
+      AND id > $1
+    ORDER BY id
+    LIMIT $2
+    """
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch(sql, after_id, limit)
+
+    trs = []
+    last_id = after_id
+    for r in rows:
+        pid = int(r["id"])
+        last_id = pid
+        fn = (r["first_name"] or "").strip() or "-"
+        ln = (r["last_name"] or "").strip() or "-"
+        trs.append(f"""
+          <tr>
+            <td><code class="badge">{pid}</code></td>
+            <td>{html_escape(fn)}</td>
+            <td>{html_escape(ln)}</td>
+            <td style="width:160px;"><a class="chip" href="/dq/contacts/person/{pid}">Öffnen</a></td>
+          </tr>
+        """)
+
+    next_link = ""
+    if rows:
+        next_link = f'<a class="btn btn-outline" href="/dq/contacts/last_name/missing?after_id={last_id}&limit={limit}">Weiter →</a>'
+
+    body = f"""
+      <div class="topbar">
+        <div>
+          <div class="title">Nachname – Fehlende Daten</div>
+          <div class="subtitle">Liste aus Cache-DB · Page size: {limit}</div>
+        </div>
+        <div style="display:flex; gap:10px;">
+          <a class="btn btn-outline" href="/overview">← Zur Übersicht</a>
+          {next_link}
+        </div>
+      </div>
+
+      <div class="panel">
+        <table>
+          <thead>
+            <tr>
+              <th style="width:120px;">ID</th>
+              <th>Vorname</th>
+              <th>Nachname</th>
+              <th style="width:160px;">Aktion</th>
+            </tr>
+          </thead>
+          <tbody>
+            {''.join(trs) if trs else '<tr><td colspan="4">✅ Keine Treffer.</td></tr>'}
+          </tbody>
+        </table>
+      </div>
+    """
+    return HTMLResponse(page_shell("Nachname – Fehlende Daten", body))
+
+@app.get("/dq/contacts/last_name/invalidchars", response_class=HTMLResponse)
+async def dq_last_name_invalidchars_db(after_id: int = 0, limit: int = 200):
+    if "default" not in user_tokens:
+        return RedirectResponse("/login")
+    if not db_pool:
+        return HTMLResponse("DB nicht initialisiert", status_code=500)
+
+    limit = max(50, min(int(limit), 500))
+    pattern = r"^[A-Za-zÄÖÜäöüß\s\-']+$"
+
+    sql = """
+    SELECT id, first_name, last_name
+    FROM persons_cache
+    WHERE last_name IS NOT NULL
+      AND btrim(last_name) <> ''
+      AND last_name !~ $1
+      AND id > $2
+    ORDER BY id
+    LIMIT $3
+    """
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch(sql, pattern, after_id, limit)
+
+    trs = []
+    last_id = after_id
+    for r in rows:
+        pid = int(r["id"])
+        last_id = pid
+        fn = (r["first_name"] or "").strip() or "-"
+        ln = (r["last_name"] or "").strip() or "-"
+        trs.append(f"""
+          <tr>
+            <td><code class="badge">{pid}</code></td>
+            <td>{html_escape(fn)}</td>
+            <td>{html_escape(ln)}</td>
+            <td style="width:160px;"><a class="chip" href="/dq/contacts/person/{pid}">Öffnen</a></td>
+          </tr>
+        """)
+
+    next_link = ""
+    if rows:
+        next_link = f'<a class="btn btn-outline" href="/dq/contacts/last_name/invalidchars?after_id={last_id}&limit={limit}">Weiter →</a>'
+
+    body = f"""
+      <div class="topbar">
+        <div>
+          <div class="title">Nachname – Ungültige Zeichen</div>
+          <div class="subtitle">Liste aus Cache-DB · Page size: {limit}</div>
+        </div>
+        <div style="display:flex; gap:10px;">
+          <a class="btn btn-outline" href="/overview">← Zur Übersicht</a>
+          {next_link}
+        </div>
+      </div>
+
+      <div class="panel">
+        <table>
+          <thead>
+            <tr>
+              <th style="width:120px;">ID</th>
+              <th>Vorname</th>
+              <th>Nachname</th>
+              <th style="width:160px;">Aktion</th>
+            </tr>
+          </thead>
+          <tbody>
+            {''.join(trs) if trs else '<tr><td colspan="4">✅ Keine Treffer.</td></tr>'}
+          </tbody>
+        </table>
+      </div>
+    """
+    return HTMLResponse(page_shell("Nachname – Ungültige Zeichen", body))
+
+def _dq_missing_sql_for_column(col: str) -> str:
+    return f"""
+    SELECT id, first_name, last_name
+    FROM persons_cache
+    WHERE ({col} IS NULL OR btrim({col}) = '')
+      AND id > $1
+    ORDER BY id
+    LIMIT $2
+    """
+
+async def _render_missing_list(title: str, base_path: str, after_id: int, limit: int, sql: str) -> HTMLResponse:
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch(sql, after_id, limit)
+
+    trs = []
+    last_id = after_id
+    for r in rows:
+        pid = int(r["id"])
+        last_id = pid
+        fn = (r["first_name"] or "").strip() or "-"
+        ln = (r["last_name"] or "").strip() or "-"
+        trs.append(f"""
+          <tr>
+            <td><code class="badge">{pid}</code></td>
+            <td>{html_escape(fn)}</td>
+            <td>{html_escape(ln)}</td>
+            <td style="width:160px;"><a class="chip" href="/dq/contacts/person/{pid}">Öffnen</a></td>
+          </tr>
+        """)
+
+    next_link = ""
+    if rows:
+        next_link = f'<a class="btn btn-outline" href="{base_path}?after_id={last_id}&limit={limit}">Weiter →</a>'
+
+    body = f"""
+      <div class="topbar">
+        <div>
+          <div class="title">{title}</div>
+          <div class="subtitle">Liste aus Cache-DB · Page size: {limit}</div>
+        </div>
+        <div style="display:flex; gap:10px;">
+          <a class="btn btn-outline" href="/overview">← Zur Übersicht</a>
+          {next_link}
+        </div>
+      </div>
+
+      <div class="panel">
+        <table>
+          <thead>
+            <tr>
+              <th style="width:120px;">ID</th>
+              <th>Vorname</th>
+              <th>Nachname</th>
+              <th style="width:160px;">Aktion</th>
+            </tr>
+          </thead>
+          <tbody>
+            {''.join(trs) if trs else '<tr><td colspan="4">✅ Keine Treffer.</td></tr>'}
+          </tbody>
+        </table>
+      </div>
+    """
+    return HTMLResponse(page_shell(title, body))
+
+@app.get("/dq/contacts/gender/missing", response_class=HTMLResponse)
+async def dq_gender_missing_db(after_id: int = 0, limit: int = 200):
+    if "default" not in user_tokens:
+        return RedirectResponse("/login")
+    if not db_pool:
+        return HTMLResponse("DB nicht initialisiert", status_code=500)
+    limit = max(50, min(int(limit), 500))
+    return await _render_missing_list("Geschlecht – Fehlende Daten", "/dq/contacts/gender/missing", after_id, limit, _dq_missing_sql_for_column("gender"))
+
+@app.get("/dq/contacts/email/missing", response_class=HTMLResponse)
+async def dq_email_missing_db(after_id: int = 0, limit: int = 200):
+    if "default" not in user_tokens:
+        return RedirectResponse("/login")
+    if not db_pool:
+        return HTMLResponse("DB nicht initialisiert", status_code=500)
+    limit = max(50, min(int(limit), 500))
+    return await _render_missing_list("E-Mail – Fehlende Daten", "/dq/contacts/email/missing", after_id, limit, _dq_missing_sql_for_column("email"))
+
+@app.get("/dq/contacts/du_sie/missing", response_class=HTMLResponse)
+async def dq_du_sie_missing_db(after_id: int = 0, limit: int = 200):
+    if "default" not in user_tokens:
+        return RedirectResponse("/login")
+    if not db_pool:
+        return HTMLResponse("DB nicht initialisiert", status_code=500)
+    limit = max(50, min(int(limit), 500))
+    return await _render_missing_list("Du oder Sie – Fehlende Daten", "/dq/contacts/du_sie/missing", after_id, limit, _dq_missing_sql_for_column("du_sie"))
+
+@app.get("/dq/contacts/position/missing", response_class=HTMLResponse)
+async def dq_position_missing_db(after_id: int = 0, limit: int = 200):
+    if "default" not in user_tokens:
+        return RedirectResponse("/login")
+    if not db_pool:
+        return HTMLResponse("DB nicht initialisiert", status_code=500)
+    limit = max(50, min(int(limit), 500))
+    return await _render_missing_list("Position – Fehlende Daten", "/dq/contacts/position/missing", after_id, limit, _dq_missing_sql_for_column("position"))
+
+@app.get("/dq/contacts/linkedin/missing", response_class=HTMLResponse)
+async def dq_linkedin_missing_db(after_id: int = 0, limit: int = 200):
+    if "default" not in user_tokens:
+        return RedirectResponse("/login")
+    if not db_pool:
+        return HTMLResponse("DB nicht initialisiert", status_code=500)
+    limit = max(50, min(int(limit), 500))
+    return await _render_missing_list("LinkedIn-URL – Fehlende Daten", "/dq/contacts/linkedin/missing", after_id, limit, _dq_missing_sql_for_column("linkedin_url"))
+
+
+@app.get("/dq/contacts/first_name/title", response_class=HTMLResponse)
+async def dq_first_name_title_db(after_id: int = 0, limit: int = 200):
+    if "default" not in user_tokens:
+        return RedirectResponse("/login")
+    if not db_pool:
+        return HTMLResponse("DB nicht initialisiert", status_code=500)
+
+    limit = max(50, min(int(limit), 500))
+
+    # Postgres-RegEx: "dr", "dr.", "prof", "herr", "frau" etc am Anfang
+    pattern = r"^\s*(dr\.?|prof\.?|mr\.?|mrs\.?|ms\.?|herr|frau)(\s|\.|$)"
+
+    sql = """
+    SELECT id, first_name, last_name
+    FROM persons_cache
+    WHERE first_name IS NOT NULL
+      AND btrim(first_name) <> ''
+      AND first_name ~* $1
+      AND id > $2
+    ORDER BY id
+    LIMIT $3
+    """
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch(sql, pattern, after_id, limit)
+
+    trs = []
+    last_id = after_id
+    for r in rows:
+        pid = int(r["id"])
+        last_id = pid
+        fn = (r["first_name"] or "").strip() or "-"
+        ln = (r["last_name"] or "").strip() or "-"
+        trs.append(f"""
+          <tr>
+            <td><code class="badge">{pid}</code></td>
+            <td>{html_escape(fn)}</td>
+            <td>{html_escape(ln)}</td>
+            <td style="width:160px;"><a class="chip" href="/dq/contacts/person/{pid}">Öffnen</a></td>
+          </tr>
+        """)
+
+    next_link = ""
+    if rows:
+        next_link = f'<a class="btn btn-outline" href="/dq/contacts/first_name/title?after_id={last_id}&limit={limit}">Weiter →</a>'
+
+    body = f"""
+      <div class="topbar">
+        <div>
+          <div class="title">Vorname – Titel im Vornamen</div>
+          <div class="subtitle">Liste aus Cache-DB · Page size: {limit}</div>
+        </div>
+        <div style="display:flex; gap:10px;">
+          <a class="btn btn-outline" href="/overview">← Zur Übersicht</a>
+          {next_link}
+        </div>
+      </div>
+
+      <div class="panel">
+        <table>
+          <thead>
+            <tr>
+              <th style="width:120px;">ID</th>
+              <th>Vorname</th>
+              <th>Nachname</th>
+              <th style="width:160px;">Aktion</th>
+            </tr>
+          </thead>
+          <tbody>
+            {''.join(trs) if trs else '<tr><td colspan="4">✅ Keine Treffer.</td></tr>'}
+          </tbody>
+        </table>
+      </div>
+    """
+    return HTMLResponse(page_shell("Vorname – Titel im Vornamen", body))
+
 
 
 @app.post("/dq/contacts/person/{person_id}/update")
