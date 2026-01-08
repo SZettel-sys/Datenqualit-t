@@ -9,6 +9,8 @@ from typing import Any, Optional
 from fastapi import FastAPI, Request, Body
 from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
+from datetime import datetime, timezone, timedelta
+
 
 app = FastAPI()
 
@@ -37,6 +39,107 @@ user_tokens: dict[str, str] = {}
 #
 ########################################################################
 DB_URL = os.getenv("DATABASE_URL")
+
+db_pool: Optional[asyncpg.Pool] = None
+
+def _utcnow():
+    return datetime.now(timezone.utc)
+
+def _parse_ts(v: Any) -> Optional[datetime]:
+    if not v:
+        return None
+    if isinstance(v, datetime):
+        return v if v.tzinfo else v.replace(tzinfo=timezone.utc)
+    if isinstance(v, str):
+        s = v.strip()
+        # Pipedrive liefert oft ISO mit Z
+        if s.endswith("Z"):
+            s = s[:-1] + "+00:00"
+        try:
+            return datetime.fromisoformat(s)
+        except Exception:
+            return None
+    return None
+
+async def init_db():
+    if not db_pool:
+        raise RuntimeError("db_pool ist nicht initialisiert")
+
+    async with db_pool.acquire() as conn:
+        await conn.execute("""
+        CREATE TABLE IF NOT EXISTS persons_cache (
+          id BIGINT PRIMARY KEY,
+          first_name TEXT,
+          last_name TEXT,
+          gender TEXT,
+          email TEXT,
+          du_sie TEXT,
+          position TEXT,
+          linkedin_url TEXT,
+          org_id BIGINT,
+          update_time TIMESTAMPTZ
+        );
+        """)
+
+        await conn.execute("""
+        CREATE TABLE IF NOT EXISTS orgs_cache (
+          id BIGINT PRIMARY KEY,
+          name TEXT,
+          update_time TIMESTAMPTZ
+        );
+        """)
+
+        await conn.execute("""
+        CREATE TABLE IF NOT EXISTS sync_state (
+          entity TEXT PRIMARY KEY,              -- 'persons' | 'organizations'
+          last_update_time TIMESTAMPTZ NOT NULL
+        );
+        """)
+
+        # Indizes für schnelle "Vorname fehlt" Queries + Join
+        await conn.execute("""
+        CREATE INDEX IF NOT EXISTS idx_persons_missing_first_name
+        ON persons_cache (id)
+        WHERE (first_name IS NULL OR btrim(first_name) = '');
+        """)
+
+        await conn.execute("""
+        CREATE INDEX IF NOT EXISTS idx_persons_org_id
+        ON persons_cache (org_id);
+        """)
+
+        await conn.execute("""
+        CREATE INDEX IF NOT EXISTS idx_orgs_name
+        ON orgs_cache (name);
+        """)
+
+async def get_sync_time(entity: str) -> datetime:
+    async with db_pool.acquire() as conn:
+        row = await conn.fetchrow("SELECT last_update_time FROM sync_state WHERE entity=$1", entity)
+        if row and row["last_update_time"]:
+            return row["last_update_time"]
+        # Default: sehr alt (Initial-Sync)
+        t0 = datetime(1970, 1, 1, tzinfo=timezone.utc)
+        await conn.execute(
+            "INSERT INTO sync_state(entity, last_update_time) VALUES($1, $2) ON CONFLICT(entity) DO NOTHING",
+            entity, t0
+        )
+        return t0
+
+async def set_sync_time(entity: str, t: datetime):
+    async with db_pool.acquire() as conn:
+        await conn.execute("""
+            INSERT INTO sync_state(entity, last_update_time)
+            VALUES($1, $2)
+            ON CONFLICT(entity) DO UPDATE SET last_update_time=EXCLUDED.last_update_time
+        """, entity, t)
+
+@app.on_event("startup")
+async def _startup():
+    global db_pool
+    if DB_URL:
+        db_pool = await asyncpg.create_pool(DB_URL, min_size=1, max_size=5)
+        await init_db()
 
 ########################################################################
 #
@@ -139,7 +242,7 @@ DQ_CARDS = [
         "title": "Vorname",
         "description": "Prüfungen für das Feld „first_name“.",
         "actions": [
-            {"label": "Fehlende Daten", "href": "/dq/contacts/missing?field=first_name"},
+            {"label": "Fehlende Daten", "href": "/dq/contacts/first_name/missing"},
             {"label": "Ungültige Zeichen", "href": "/dq/contacts/invalidchars?field=first_name"},
             {"label": "Titel im Vornamen", "href": "/dq/contacts/title_in_first_name"},
         ],
@@ -326,6 +429,215 @@ async def pipedrive_update_v2(entity: str, entity_id: int, payload: dict, header
         raise RuntimeError(f"Update fehlgeschlagen ({r2.status_code}): {r2.text}")
 
 
+async def iter_v2_pages(endpoint: str, headers: dict, params: Optional[dict] = None, max_pages: int = 20):
+    """
+    Iteriert cursor-basiert über v2 endpoints.
+    - max_pages: Begrenze Seiten pro Run (wichtig für Render-Timeouts).
+      max_pages=0 => unbegrenzt
+    """
+    params = params or {}
+    cursor = None
+    pages = 0
+
+    async with httpx.AsyncClient(timeout=60.0) as client:
+        while True:
+            p = dict(params)
+            p["limit"] = int(p.get("limit") or 500)
+            if cursor:
+                p["cursor"] = cursor
+
+            resp = await client.get(f"{PIPEDRIVE_API_V2_URL}/{endpoint}", headers=headers, params=p)
+            if resp.status_code != 200:
+                raise RuntimeError(f"Pipedrive API Fehler ({resp.status_code}): {resp.text}")
+
+            payload = resp.json() or {}
+            items = payload.get("data") or []
+            add = payload.get("additional_data") or {}
+            cursor = add.get("next_cursor")
+
+            if items:
+                yield items
+
+            pages += 1
+            if max_pages and pages >= max_pages:
+                break
+
+            if not cursor:
+                break
+
+
+def _get_org_id_from_person(p: dict) -> Optional[int]:
+    org_id = p.get("org_id") or p.get("organization_id")
+    if isinstance(org_id, dict):
+        org_id = org_id.get("value") or org_id.get("id")
+    try:
+        return int(org_id) if org_id is not None else None
+    except Exception:
+        return None
+
+
+def _email_first(p: dict) -> str:
+    # p['email'] kann str, list[dict], list[str] sein
+    val = _scalarize(p.get("email")).strip()
+    if not val:
+        return ""
+    return val.split(",")[0].strip()
+
+
+async def upsert_persons(batch: list[dict]) -> Optional[datetime]:
+    if not batch:
+        return None
+
+    rows = []
+    max_ts: Optional[datetime] = None
+
+    for p in batch:
+        pid = p.get("id")
+        if pid is None:
+            continue
+
+        ts = _parse_ts(p.get("update_time") or p.get("updated_at") or p.get("updateTime"))
+        if ts and (max_ts is None or ts > max_ts):
+            max_ts = ts
+
+        rows.append((
+            int(pid),
+            _scalarize(p.get("first_name")).strip(),
+            _scalarize(p.get("last_name")).strip(),
+            _scalarize(p.get(PD_PERSON_GENDER_KEY)).strip(),
+            _email_first(p),
+            _scalarize(p.get(PD_PERSON_DU_SIE_KEY)).strip(),
+            _scalarize(p.get(PD_PERSON_POSITION_KEY)).strip(),
+            _scalarize(p.get(PD_PERSON_LINKEDIN_KEY)).strip(),
+            _get_org_id_from_person(p),
+            ts
+        ))
+
+    if not rows:
+        return max_ts
+
+    sql = """
+    INSERT INTO persons_cache
+      (id, first_name, last_name, gender, email, du_sie, position, linkedin_url, org_id, update_time)
+    VALUES
+      ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+    ON CONFLICT (id) DO UPDATE SET
+      first_name   = EXCLUDED.first_name,
+      last_name    = EXCLUDED.last_name,
+      gender       = EXCLUDED.gender,
+      email        = EXCLUDED.email,
+      du_sie       = EXCLUDED.du_sie,
+      position     = EXCLUDED.position,
+      linkedin_url = EXCLUDED.linkedin_url,
+      org_id       = EXCLUDED.org_id,
+      update_time  = COALESCE(EXCLUDED.update_time, persons_cache.update_time)
+    """
+
+    async with db_pool.acquire() as conn:
+        await conn.executemany(sql, rows)
+
+    return max_ts
+
+
+async def upsert_orgs(batch: list[dict]) -> Optional[datetime]:
+    if not batch:
+        return None
+
+    rows = []
+    max_ts: Optional[datetime] = None
+
+    for o in batch:
+        oid = o.get("id")
+        if oid is None:
+            continue
+
+        ts = _parse_ts(o.get("update_time") or o.get("updated_at") or o.get("updateTime"))
+        if ts and (max_ts is None or ts > max_ts):
+            max_ts = ts
+
+        rows.append((
+            int(oid),
+            _scalarize(o.get("name")).strip(),
+            ts
+        ))
+
+    if not rows:
+        return max_ts
+
+    sql = """
+    INSERT INTO orgs_cache (id, name, update_time)
+    VALUES ($1,$2,$3)
+    ON CONFLICT (id) DO UPDATE SET
+      name        = EXCLUDED.name,
+      update_time = COALESCE(EXCLUDED.update_time, orgs_cache.update_time)
+    """
+
+    async with db_pool.acquire() as conn:
+        await conn.executemany(sql, rows)
+
+    return max_ts
+
+
+async def sync_persons_incremental(full: bool = False, max_pages: int = 20) -> dict:
+    headers = get_headers()
+    if not headers:
+        raise RuntimeError("Nicht eingeloggt")
+
+    since = await get_sync_time("persons")
+    # Overlap (2 Minuten) gegen Race Conditions / Uhrzeit-Granularität
+    if not full:
+        since = since - timedelta(minutes=2)
+
+    params = {"limit": 500}
+    # Wenn Pipedrive updated_since unterstützt:
+    if not full:
+        params["updated_since"] = since.isoformat()
+
+    # optional: Felder reduzieren (falls API das unterstützt – wenn nicht, rausnehmen)
+    # params["include_fields"] = "id,first_name,last_name,email,org_id,update_time"
+    # params["custom_fields"] = f"{PD_PERSON_GENDER_KEY},{PD_PERSON_DU_SIE_KEY},{PD_PERSON_POSITION_KEY},{PD_PERSON_LINKEDIN_KEY}"
+
+    max_seen: Optional[datetime] = None
+    total = 0
+
+    async for items in iter_v2_pages("persons", headers=headers, params=params, max_pages=max_pages):
+        total += len(items)
+        ts = await upsert_persons(items)
+        if ts and (max_seen is None or ts > max_seen):
+            max_seen = ts
+
+    if max_seen:
+        await set_sync_time("persons", max_seen)
+
+    return {"entity": "persons", "full": full, "max_pages": max_pages, "processed": total, "new_sync_time": max_seen.isoformat() if max_seen else None}
+
+
+async def sync_orgs_incremental(full: bool = False, max_pages: int = 20) -> dict:
+    headers = get_headers()
+    if not headers:
+        raise RuntimeError("Nicht eingeloggt")
+
+    since = await get_sync_time("organizations")
+    if not full:
+        since = since - timedelta(minutes=2)
+
+    params = {"limit": 500}
+    if not full:
+        params["updated_since"] = since.isoformat()
+
+    max_seen: Optional[datetime] = None
+    total = 0
+
+    async for items in iter_v2_pages("organizations", headers=headers, params=params, max_pages=max_pages):
+        total += len(items)
+        ts = await upsert_orgs(items)
+        if ts and (max_seen is None or ts > max_seen):
+            max_seen = ts
+
+    if max_seen:
+        await set_sync_time("organizations", max_seen)
+
+    return {"entity": "organizations", "full": full, "max_pages": max_pages, "processed": total, "new_sync_time": max_seen.isoformat() if max_seen else None}
 
 ########################################################################
 #
@@ -633,6 +945,236 @@ async def dq_contacts_title_in_first_name():
     body = _render_results_table(title, subtitle, "person", "first_name", rows)
     return HTMLResponse(page_shell(title, body))
 
+async def db_fetch_missing_first_name(after_id: int = 0, limit: int = 200) -> list[dict]:
+    sql = """
+    SELECT id, first_name, last_name, email, org_id
+    FROM persons_cache
+    WHERE (first_name IS NULL OR btrim(first_name) = '')
+      AND id > $1
+    ORDER BY id
+    LIMIT $2
+    """
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch(sql, after_id, limit)
+    return [dict(r) for r in rows]
+
+
+async def db_fetch_person_detail(person_id: int) -> dict:
+    sql = """
+    SELECT
+      p.id, p.first_name, p.last_name, p.gender, p.email, p.du_sie, p.position, p.linkedin_url,
+      p.org_id,
+      COALESCE(o.name, '-') AS org_name
+    FROM persons_cache p
+    LEFT JOIN orgs_cache o ON o.id = p.org_id
+    WHERE p.id = $1
+    """
+    async with db_pool.acquire() as conn:
+        row = await conn.fetchrow(sql, person_id)
+    return dict(row) if row else {}
+
+
+async def db_update_person_cache(person_id: int, data: dict):
+    sql = """
+    UPDATE persons_cache SET
+      first_name=$2, last_name=$3, gender=$4, email=$5, du_sie=$6, position=$7, linkedin_url=$8,
+      update_time=$9
+    WHERE id=$1
+    """
+    async with db_pool.acquire() as conn:
+        await conn.execute(
+            sql,
+            person_id,
+            data.get("first_name"),
+            data.get("last_name"),
+            data.get("gender"),
+            data.get("email"),
+            data.get("du_sie"),
+            data.get("position"),
+            data.get("linkedin_url"),
+            _utcnow()
+        )
+
+
+@app.get("/dq/contacts/first_name/missing", response_class=HTMLResponse)
+async def dq_first_name_missing_db(after_id: int = 0, limit: int = 200):
+    if "default" not in user_tokens:
+        return RedirectResponse("/login")
+    if not db_pool:
+        return HTMLResponse("DB nicht initialisiert (DATABASE_URL fehlt)", status_code=500)
+
+    limit = max(50, min(int(limit), 500))
+    rows = await db_fetch_missing_first_name(after_id=after_id, limit=limit)
+
+    trs = []
+    last_id = after_id
+    for r in rows:
+        pid = r["id"]
+        last_id = pid
+        display = (f"{(r.get('first_name') or '').strip()} {(r.get('last_name') or '').strip()}").strip() or "-"
+        trs.append(f"""
+          <tr>
+            <td><code class="badge">{pid}</code></td>
+            <td>{html_escape(display)}</td>
+            <td>{html_escape((r.get("email") or "").strip() or "-")}</td>
+            <td style="width:160px;"><a class="chip" href="/dq/contacts/person/{pid}">Öffnen</a></td>
+          </tr>
+        """)
+
+    next_link = ""
+    if rows:
+        next_link = f'<a class="btn btn-outline" href="/dq/contacts/first_name/missing?after_id={last_id}&limit={limit}">Weiter →</a>'
+
+    body = f"""
+      <div class="topbar">
+        <div>
+          <div class="title">Vorname – Fehlende Daten</div>
+          <div class="subtitle">Liste aus Cache-DB · Page size: {limit}</div>
+        </div>
+        <div style="display:flex; gap:10px;">
+          <a class="btn btn-outline" href="/overview">← Zur Übersicht</a>
+          {next_link}
+        </div>
+      </div>
+
+      <div class="panel">
+        <table>
+          <thead>
+            <tr>
+              <th style="width:120px;">ID</th>
+              <th>Kontakt</th>
+              <th>E-Mail</th>
+              <th style="width:160px;">Aktion</th>
+            </tr>
+          </thead>
+          <tbody>
+            {''.join(trs) if trs else '<tr><td colspan="4">✅ Keine Treffer (oder Sync noch nicht gelaufen).</td></tr>'}
+          </tbody>
+        </table>
+      </div>
+    """
+    return HTMLResponse(page_shell("Vorname – Fehlende Daten", body))
+
+
+@app.get("/dq/contacts/person/{person_id}", response_class=HTMLResponse)
+async def dq_person_detail_db(person_id: int, saved: int = 0):
+    if "default" not in user_tokens:
+        return RedirectResponse("/login")
+    if not db_pool:
+        return HTMLResponse("DB nicht initialisiert (DATABASE_URL fehlt)", status_code=500)
+
+    p = await db_fetch_person_detail(person_id)
+    if not p:
+        return HTMLResponse("Kontakt nicht im Cache gefunden. Bitte Sync laufen lassen.", status_code=404)
+
+    notice = ""
+    if saved == 1:
+        notice = '<div class="panel" style="margin-bottom:12px; border-color: rgba(14,165,233,.35);">✅ Gespeichert.</div>'
+
+    def val(k: str) -> str:
+        return html_escape((p.get(k) or "").strip())
+
+    body = f"""
+      <div class="topbar">
+        <div>
+          <div class="title">Kontakt bearbeiten</div>
+          <div class="subtitle"><code class="badge">{person_id}</code> · Organisation: <b>{html_escape(p.get("org_name") or "-")}</b></div>
+        </div>
+        <div style="display:flex; gap:10px;">
+          <a class="btn btn-outline" href="/dq/contacts/first_name/missing">← Zur Liste</a>
+          <a class="btn btn-outline" href="/overview">Übersicht</a>
+        </div>
+      </div>
+
+      {notice}
+
+      <div class="panel">
+        <table>
+          <tbody>
+            <tr><th style="width:240px;">Vorname</th><td><input class="field-input" id="first_name" value="{val("first_name")}" /></td></tr>
+            <tr><th>Nachname</th><td><input class="field-input" id="last_name" value="{val("last_name")}" /></td></tr>
+            <tr><th>Geschlecht</th><td><input class="field-input" id="gender" value="{val("gender")}" /></td></tr>
+            <tr><th>E-Mail-Adresse</th><td><input class="field-input" id="email" value="{val("email")}" /></td></tr>
+            <tr><th>Du oder Sie</th><td><input class="field-input" id="du_sie" value="{val("du_sie")}" /></td></tr>
+            <tr><th>Position</th><td><input class="field-input" id="position" value="{val("position")}" /></td></tr>
+            <tr><th>LinkedIn-URL</th><td><input class="field-input" id="linkedin_url" value="{val("linkedin_url")}" /></td></tr>
+            <tr><th>Organisation</th><td><input class="field-input" value="{html_escape(p.get("org_name") or "-")}" disabled /></td></tr>
+          </tbody>
+        </table>
+
+        <div style="margin-top:12px; display:flex; gap:10px;">
+          <button class="btn btn-primary" onclick="savePerson({person_id})">Speichern</button>
+        </div>
+      </div>
+
+      <script>
+        async function savePerson(personId) {{
+          const payload = {{
+            first_name: document.getElementById("first_name").value || "",
+            last_name: document.getElementById("last_name").value || "",
+            gender: document.getElementById("gender").value || "",
+            email: document.getElementById("email").value || "",
+            du_sie: document.getElementById("du_sie").value || "",
+            position: document.getElementById("position").value || "",
+            linkedin_url: document.getElementById("linkedin_url").value || ""
+          }};
+
+          const res = await fetch(`/dq/contacts/person/${{personId}}/update`, {{
+            method:"POST",
+            headers:{{"Content-Type":"application/json"}},
+            body: JSON.stringify(payload)
+          }});
+
+          const data = await res.json();
+          if(data.ok) {{
+            window.location.href = `/dq/contacts/person/${{personId}}?saved=1`;
+          }} else {{
+            alert("❌ Fehler: " + (data.error || "Unbekannt"));
+          }}
+        }}
+      </script>
+    """
+    return HTMLResponse(page_shell("Kontakt bearbeiten", body))
+
+
+@app.post("/dq/contacts/person/{person_id}/update")
+async def dq_person_update_db(person_id: int, payload: dict = Body(...)):
+    if "default" not in user_tokens:
+        return JSONResponse({"ok": False, "error": "Nicht eingeloggt"}, status_code=401)
+
+    headers = get_headers()
+
+    # Mapping: Cache-Feldnamen -> Pipedrive-Feldkeys
+    pd_payload = {
+        "first_name": (payload.get("first_name") or "").strip(),
+        "last_name": (payload.get("last_name") or "").strip(),
+        PD_PERSON_GENDER_KEY: (payload.get("gender") or "").strip(),
+        PD_PERSON_DU_SIE_KEY: (payload.get("du_sie") or "").strip(),
+        PD_PERSON_POSITION_KEY: (payload.get("position") or "").strip(),
+        PD_PERSON_LINKEDIN_KEY: (payload.get("linkedin_url") or "").strip(),
+    }
+
+    email = (payload.get("email") or "").strip()
+    pd_payload["email"] = [{"value": email, "primary": True}] if email else []
+
+    try:
+        await pipedrive_update_v2("persons", person_id, pd_payload, headers)
+
+        # Cache aktualisieren (ohne extra GET)
+        if db_pool:
+            await db_update_person_cache(person_id, {
+                "first_name": pd_payload["first_name"],
+                "last_name": pd_payload["last_name"],
+                "gender": pd_payload[PD_PERSON_GENDER_KEY],
+                "email": email,
+                "du_sie": pd_payload[PD_PERSON_DU_SIE_KEY],
+                "position": pd_payload[PD_PERSON_POSITION_KEY],
+                "linkedin_url": pd_payload[PD_PERSON_LINKEDIN_KEY],
+            })
+
+        return {"ok": True}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
 
 ########################################################################
 #
@@ -746,6 +1288,37 @@ async def dq_update(payload: dict = Body(...)):
         return {"ok": True, "result": result.get("data") or result}
     except Exception as e:
         return {"ok": False, "error": str(e)}
+
+########################################################################
+#
+# ENDPUNKTE DB
+#
+########################################################################
+@app.get("/admin/sync")
+async def admin_sync(entity: str = "persons", full: int = 0, max_pages: int = 20):
+    if "default" not in user_tokens:
+        return RedirectResponse("/login")
+
+    if not db_pool:
+        return {"ok": False, "error": "DATABASE_URL fehlt / DB nicht initialisiert"}
+
+    if entity == "persons":
+        res = await sync_persons_incremental(full=bool(full), max_pages=max_pages)
+        return {"ok": True, "result": res}
+    if entity in ("orgs", "organizations"):
+        res = await sync_orgs_incremental(full=bool(full), max_pages=max_pages)
+        return {"ok": True, "result": res}
+
+    return {"ok": False, "error": "entity muss 'persons' oder 'organizations' sein"}
+
+
+@app.get("/admin/sync/status")
+async def admin_sync_status():
+    if not db_pool:
+        return {"ok": False, "error": "DB nicht initialisiert"}
+    p = await get_sync_time("persons")
+    o = await get_sync_time("organizations")
+    return {"ok": True, "persons_last": p.isoformat(), "orgs_last": o.isoformat()}
 
 
 ########################################################################
