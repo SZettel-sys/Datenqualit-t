@@ -311,7 +311,7 @@ DQ_CARDS = [
         "title": "E-Mail-Adresse",
         "description": "",
         "actions": [
-            {"label": "Fehlende Daten", "href": "/dq/contacts/missing?field=email"},
+            {"label": "Fehlende Daten", "href": "/dq/contacts/missing?field=emails"},
         ],
     },
     {
@@ -374,6 +374,124 @@ DQ_CARDS = [
 #  Pipedrive Fetch Helpers
 #
 ########################################################################
+
+def pd_get_value_v2(entity: dict, field_key: str):
+    """
+    v2: Standard-Felder liegen auf Root-Level (z.B. first_name, last_name, emails, label_ids, org_id ...)
+    v2: Custom Fields liegen unter entity["custom_fields"][<key>]
+    """
+    if not entity:
+        return None
+
+    # Root fields we use in UI/logic
+    ROOT_FIELDS = {
+        "id", "name", "first_name", "last_name", "org_id",
+        "emails", "phones", "label_ids", "visible_to",
+        "add_time", "update_time"
+    }
+    if field_key in ROOT_FIELDS:
+        return entity.get(field_key)
+
+    # Custom fields (v2)
+    cf = entity.get("custom_fields") or {}
+    return cf.get(field_key)
+
+
+def normalize_person_update_payload_v2(field_key: str, value: str) -> dict:
+    """
+    Baut ein v2-konformes PATCH-Payload-Fragment.
+    - emails: array of objects
+    - custom fields: unter custom_fields
+    - single option custom fields: int (wenn möglich)
+    """
+    v = (value or "").strip()
+
+    # 1) emails (v2)
+    if field_key == "emails":
+        if not v:
+            return {"emails": []}
+        # Single primary mail setzen
+        return {"emails": [{"value": v, "primary": True}]}
+
+    # 2) label_ids (v2 root field, array)
+    if field_key == "label_ids":
+        # Erwartung: "1,2,3" oder "" (UI kannst du später schöner machen)
+        if not v:
+            return {"label_ids": []}
+        ids = []
+        for part in v.split(","):
+            part = part.strip()
+            if part.isdigit():
+                ids.append(int(part))
+        return {"label_ids": ids}
+
+    # 3) Custom fields (v2)
+    SINGLE_OPTION_CUSTOM_FIELDS = {
+        PD_PERSON_GENDER_KEY,
+        PD_PERSON_DU_SIE_KEY,
+    }
+
+    if field_key in SINGLE_OPTION_CUSTOM_FIELDS:
+        # v2: option id als Zahl (int) :contentReference[oaicite:6]{index=6}
+        if not v:
+            cf_val = None
+        elif v.isdigit():
+            cf_val = int(v)
+        else:
+            # Falls UI mal Labels schickt: hier NICHT mappen, sondern sauber im UI IDs verwenden
+            cf_val = None
+        return {"custom_fields": {field_key: cf_val}}
+
+    # Text/sonstige Custom Fields
+    # (Position, Linkedin etc.)
+    if field_key in {
+        PD_PERSON_POSITION_KEY,
+        PD_PERSON_LINKEDIN_KEY,
+        PD_PERSON_GENDER_KEY,
+        PD_PERSON_DU_SIE_KEY,
+    }:
+        return {"custom_fields": {field_key: (v if v else None)}}
+
+    # Default: Root-Feld direkt patchen
+    return {field_key: (v if v else None)}
+
+async def fetch_all_v2(endpoint: str, headers: dict, params: Optional[dict] = None) -> list[dict]:
+    """
+    Cursor-basierte Pagination (v2) – gibt alle items als Liste zurück.
+    Tipp Performance:
+    - für persons/organizations NUR benötigte custom_fields via params["custom_fields"] (max 15 keys) :contentReference[oaicite:7]{index=7}
+    """
+    if params is None:
+        params = {}
+
+    out: list[dict] = []
+    limit = int(params.get("limit") or 500)
+    cursor = None
+
+    async with httpx.AsyncClient(timeout=60.0) as client:
+        while True:
+            p = dict(params)
+            p["limit"] = limit
+            if cursor:
+                p["cursor"] = cursor
+
+            resp = await client.get(f"{PIPEDRIVE_API_V2_URL}/{endpoint}", headers=headers, params=p)
+            if resp.status_code != 200:
+                raise RuntimeError(f"Pipedrive API Fehler ({resp.status_code}): {resp.text}")
+
+            data = resp.json() or {}
+            items = data.get("data") or []
+            if not items:
+                break
+
+            out.extend(items)
+            cursor = (data.get("additional_data") or {}).get("next_cursor")
+            if not cursor:
+                break
+
+    return out
+
+
 
 def _scalarize(v: Any) -> str:
     """Versucht, den Wert UI-tauglich als String zu machen (inkl. v2 email/list/dict)."""
@@ -809,6 +927,233 @@ async def admin_sync_reset(entity: str = "persons"):
 
     return {"ok": True, "entity": entity, "reset": True}
 
+def _primary_from_list(items: Any) -> str:
+    """
+    v2 emails/phones sind Listen von Objekten:
+    [{"label":"work","value":"x","primary":true}, ...]
+    """
+    if not isinstance(items, list) or not items:
+        return ""
+    # primary zuerst
+    for it in items:
+        if isinstance(it, dict) and it.get("primary") and it.get("value"):
+            return str(it.get("value") or "").strip()
+    # sonst erstes mit value
+    for it in items:
+        if isinstance(it, dict) and it.get("value"):
+            return str(it.get("value") or "").strip()
+    return ""
+
+
+async def pipedrive_get_person_v2(person_id: int, headers: dict) -> dict:
+    """
+    Holt eine Person aus API v2 inkl. ausgewählter custom fields (max 15 keys).
+    """
+    custom_keys = ",".join(
+        [
+            PD_PERSON_GENDER_KEY,
+            PD_PERSON_DU_SIE_KEY,
+            PD_PERSON_POSITION_KEY,
+            PD_PERSON_LINKEDIN_KEY,
+        ]
+    )
+
+    params = {"custom_fields": custom_keys}
+
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        r = await client.get(
+            f"{PIPEDRIVE_API_V2_URL}/persons/{person_id}",
+            headers=headers,
+            params=params,
+        )
+    if r.status_code != 200:
+        raise RuntimeError(f"Person GET fehlgeschlagen ({r.status_code}): {r.text}")
+
+    data = r.json() or {}
+    return data.get("data") or {}
+
+_PERSON_FIELD_CACHE: dict[str, dict] = {}
+
+
+async def pipedrive_get_person_field_v2(field_code: str, headers: dict) -> dict:
+    """
+    Holt Definition eines Person-Feldes (inkl. options) aus Fields API v2.
+    field_code ist bei Custom Fields i.d.R. dein Hash-Key.
+    """
+    if field_code in _PERSON_FIELD_CACHE:
+        return _PERSON_FIELD_CACHE[field_code]
+
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        r = await client.get(f"{PIPEDRIVE_API_V2_URL}/personFields/{field_code}", headers=headers)
+
+    if r.status_code != 200:
+        raise RuntimeError(f"personField GET fehlgeschlagen ({r.status_code}): {r.text}")
+
+    payload = r.json() or {}
+    field = payload.get("data") or {}
+    _PERSON_FIELD_CACHE[field_code] = field
+    return field
+
+
+async def get_enum_options(field_code: str, headers: dict) -> list[dict]:
+    """
+    Gibt Optionen zurück als Liste [{id:..., label:...}, ...]
+    """
+    field = await pipedrive_get_person_field_v2(field_code, headers)
+    opts = field.get("options") or []
+    # robust: nur id/label extrahieren
+    out = []
+    for o in opts:
+        if isinstance(o, dict) and "id" in o:
+            out.append(
+                {
+                    "id": o.get("id"),
+                    "label": o.get("label") or o.get("name") or str(o.get("id")),
+                }
+            )
+    return out
+
+
+def _render_select(name: str, options: list[dict], selected_value: Any) -> str:
+    sel = "" if selected_value is None else str(selected_value)
+    rows = ['<option value="">— bitte wählen —</option>']
+    for o in options:
+        oid = "" if o.get("id") is None else str(o.get("id"))
+        lab = html_escape(str(o.get("label") or ""))
+        selected_attr = " selected" if oid == sel else ""
+        rows.append(f'<option value="{html_escape(oid)}"{selected_attr}>{lab}</option>')
+    return f'<select class="field-input" name="{html_escape(name)}">{"".join(rows)}</select>'
+
+async def fetch_persons_page_v2(headers: dict, cursor: str | None, limit: int, custom_keys: list[str]) -> tuple[list[dict], str | None]:
+    params = {"limit": limit}
+    if cursor:
+        params["cursor"] = cursor
+    if custom_keys:
+        params["custom_fields"] = ",".join(custom_keys)
+
+    async with httpx.AsyncClient(timeout=60.0) as client:
+        r = await client.get(f"{PIPEDRIVE_API_V2_URL}/persons", headers=headers, params=params)
+
+    if r.status_code != 200:
+        raise RuntimeError(f"Persons page Fehler ({r.status_code}): {r.text}")
+
+    payload = r.json() or {}
+    items = payload.get("data") or []
+    next_cursor = (payload.get("additional_data") or {}).get("next_cursor")
+    return items, next_cursor
+
+
+async def collect_bad_persons(
+    headers: dict,
+    page_size: int,
+    start_cursor: str | None,
+    predicate,
+    need_custom_keys: list[str],
+    scan_limit_per_call: int = 500,
+    max_pages_scan: int = 30,
+) -> tuple[list[dict], str | None]:
+    """
+    Scannt pages, bis page_size Treffer gesammelt oder keine Daten mehr.
+    Damit bleibt UI schnell, auch bei 300k Datensätzen.
+    """
+    bad: list[dict] = []
+    cursor = start_cursor
+    pages = 0
+
+    while len(bad) < page_size and pages < max_pages_scan:
+        pages += 1
+        persons, next_cursor = await fetch_persons_page_v2(
+            headers=headers,
+            cursor=cursor,
+            limit=scan_limit_per_call,
+            custom_keys=need_custom_keys,
+        )
+        if not persons:
+            return bad, None
+
+        for p in persons:
+            if predicate(p):
+                bad.append(p)
+                if len(bad) >= page_size:
+                    break
+
+        cursor = next_cursor
+        if not cursor:
+            break
+
+    return bad, cursor
+
+@app.get("/dq/contacts/first_name/missing", response_class=HTMLResponse)
+async def dq_contacts_first_name_missing(cursor: str | None = None, page_size: int = 200):
+    if "default" not in user_tokens:
+        return RedirectResponse("/login")
+
+    headers = get_headers()
+    if not headers:
+        return RedirectResponse("/login")
+
+    def pred(p: dict) -> bool:
+        v = p.get("first_name")
+        return v is None or (isinstance(v, str) and v.strip() == "")
+
+    persons, next_cursor = await collect_bad_persons(
+        headers=headers,
+        page_size=page_size,
+        start_cursor=cursor,
+        predicate=pred,
+        need_custom_keys=[],  # hier brauchen wir keine custom fields
+    )
+
+    # table rows
+    trs = []
+    for p in persons:
+        pid = p.get("id")
+        fn = html_escape(str(p.get("first_name") or ""))
+        ln = html_escape(str(p.get("last_name") or ""))
+        trs.append(f"""
+          <tr>
+            <td><code class="badge">{pid}</code></td>
+            <td>{fn}</td>
+            <td>{ln}</td>
+            <td>
+              <a class="btn btn-sm btn-primary" href="/dq/contacts/person/{pid}">Öffnen</a>
+            </td>
+          </tr>
+        """)
+
+    next_link = ""
+    if next_cursor:
+        next_link = f'<a class="btn btn-outline" href="/dq/contacts/first_name/missing?cursor={html_escape(next_cursor)}&page_size={page_size}">Weiter →</a>'
+
+    body = f"""
+      <div class="topbar">
+        <div>
+          <div class="title">Vorname – Fehlende Daten</div>
+          <div class="subtitle">Page size: {page_size}</div>
+        </div>
+        <div style="display:flex; gap:10px;">
+          <a class="btn btn-outline" href="/overview">← Zur Übersicht</a>
+          {next_link}
+        </div>
+      </div>
+
+      <div class="panel">
+        <table>
+          <thead>
+            <tr>
+              <th style="width:120px;">ID</th>
+              <th>Vorname</th>
+              <th>Nachname</th>
+              <th style="width:160px;">Aktion</th>
+            </tr>
+          </thead>
+          <tbody>
+            {''.join(trs) if trs else '<tr><td colspan="4">✅ Keine Treffer.</td></tr>'}
+          </tbody>
+        </table>
+      </div>
+    """
+    return HTMLResponse(page_shell("Vorname – Fehlende Daten", body))
 
 ########################################################################
 #
@@ -902,6 +1247,144 @@ def _render_cards(group: str) -> str:
     """
 
 
+@app.get("/dq/contacts/person/{person_id}", response_class=HTMLResponse)
+async def dq_contact_edit(person_id: int):
+    if "default" not in user_tokens:
+        return RedirectResponse("/login")
+
+    headers = get_headers()
+    p = await pipedrive_get_person_v2(person_id, headers)
+
+    custom = p.get("custom_fields") or {}
+    gender_val = custom.get(PD_PERSON_GENDER_KEY)
+    dusie_val = custom.get(PD_PERSON_DU_SIE_KEY)
+
+    gender_opts = await get_enum_options(PD_PERSON_GENDER_KEY, headers)
+    dusie_opts = await get_enum_options(PD_PERSON_DU_SIE_KEY, headers)
+
+    # v2: emails ist Liste
+    email_primary = _primary_from_list(p.get("emails"))
+
+    body = f"""
+      <div class="topbar">
+        <div>
+          <div class="title">Kontakt bearbeiten</div>
+          <div class="subtitle"><code class="badge">{person_id}</code></div>
+        </div>
+        <div style="display:flex; gap:10px;">
+          <a class="btn btn-outline" href="/dq/contacts/first_name/missing">← Zur Liste</a>
+        </div>
+      </div>
+
+      <div class="panel">
+        <div style="display:grid; grid-template-columns: 220px 1fr; gap:10px; align-items:center;">
+          <div class="small">Vorname</div>
+          <input class="field-input" id="first_name" value="{html_escape(str(p.get("first_name") or ""))}"/>
+
+          <div class="small">Nachname</div>
+          <input class="field-input" id="last_name" value="{html_escape(str(p.get("last_name") or ""))}"/>
+
+          <div class="small">Geschlecht</div>
+          {_render_select("gender", gender_opts, gender_val)}
+
+          <div class="small">E-Mail-Adresse (primary)</div>
+          <input class="field-input" id="email_primary" value="{html_escape(email_primary)}"/>
+
+          <div class="small">Du oder Sie</div>
+          {_render_select("dusie", dusie_opts, dusie_val)}
+
+          <div class="small">Position</div>
+          <input class="field-input" id="position" value="{html_escape(str(custom.get(PD_PERSON_POSITION_KEY) or ""))}"/>
+
+          <div class="small">LinkedIn-URL</div>
+          <input class="field-input" id="linkedin" value="{html_escape(str(custom.get(PD_PERSON_LINKEDIN_KEY) or ""))}"/>
+        </div>
+
+        <div style="margin-top:16px;">
+          <button class="btn btn-primary" onclick="savePerson()">Speichern</button>
+        </div>
+      </div>
+
+      <script>
+        async function savePerson(){{
+          const genderSelect = document.querySelector('select[name="gender"]');
+          const dusieSelect = document.querySelector('select[name="dusie"]');
+
+          const payload = {{
+            person_id: {person_id},
+            first_name: document.getElementById("first_name").value || "",
+            last_name: document.getElementById("last_name").value || "",
+            email_primary: document.getElementById("email_primary").value || "",
+            gender_id: genderSelect ? genderSelect.value : "",
+            dusie_id: dusieSelect ? dusieSelect.value : "",
+            position: document.getElementById("position").value || "",
+            linkedin: document.getElementById("linkedin").value || "",
+          }};
+
+          const res = await fetch("/dq/contacts/person/save", {{
+            method:"POST",
+            headers:{{"Content-Type":"application/json"}},
+            body: JSON.stringify(payload)
+          }});
+
+          const data = await res.json();
+          if(data.ok) {{
+            alert("✅ Gespeichert.");
+            location.reload();
+          }} else {{
+            alert("❌ Fehler: " + (data.error || "Unbekannt"));
+          }}
+        }}
+      </script>
+    """
+    return HTMLResponse(page_shell("Kontakt bearbeiten", body))
+
+
+@app.post("/dq/contacts/person/save")
+async def dq_contact_save(payload: dict = Body(...)):
+    """
+    Speichert ausgewählte Felder per v2 PATCH.
+    - Standardfelder: first_name, last_name, emails
+    - Custom fields: gender, du/sie, position, linkedin via custom_fields
+    """
+    if "default" not in user_tokens:
+        return JSONResponse({"ok": False, "error": "Nicht eingeloggt"}, status_code=401)
+
+    headers = get_headers()
+    person_id = int(payload.get("person_id"))
+
+    first_name = (payload.get("first_name") or "").strip()
+    last_name = (payload.get("last_name") or "").strip()
+    email_primary = (payload.get("email_primary") or "").strip()
+
+    gender_id = (payload.get("gender_id") or "").strip()
+    dusie_id = (payload.get("dusie_id") or "").strip()
+
+    position = (payload.get("position") or "").strip()
+    linkedin = (payload.get("linkedin") or "").strip()
+
+    patch = {
+        "first_name": first_name,
+        "last_name": last_name,
+        # v2: emails ist Liste von Objekten
+        "emails": ([{"label": "work", "value": email_primary, "primary": True}] if email_primary else []),
+        # v2: custom fields liegen unter custom_fields
+        "custom_fields": {
+            PD_PERSON_GENDER_KEY: (int(gender_id) if gender_id else None),
+            PD_PERSON_DU_SIE_KEY: (int(dusie_id) if dusie_id else None),
+            PD_PERSON_POSITION_KEY: (position if position else None),
+            PD_PERSON_LINKEDIN_KEY: (linkedin if linkedin else None),
+        },
+    }
+
+    # None-Werte entfernen, damit PATCH "sauber" bleibt
+    patch["custom_fields"] = {k: v for k, v in patch["custom_fields"].items() if v is not None}
+
+    try:
+        result = await pipedrive_patch_v2("persons", person_id, patch, headers)
+        return {"ok": True, "result": result.get("data") or result}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
 
 
 ########################################################################
@@ -942,25 +1425,43 @@ def logout():
 #  ENDPUNKTE KONTAKTE
 #
 ########################################################################
+
 async def _dq_scan_contacts_missing(field_key: str) -> list[dict]:
     headers = get_headers()
     if not headers:
         raise RuntimeError("Nicht eingeloggt")
 
-    # persons endpoint
-    persons = await fetch_all_v2("persons", headers=headers)
+    # Nur die Custom Fields laden, die wir wirklich brauchen (max 15) :contentReference[oaicite:8]{index=8}
+    needed_custom_fields = [
+        PD_PERSON_GENDER_KEY,
+        PD_PERSON_DU_SIE_KEY,
+        PD_PERSON_POSITION_KEY,
+        PD_PERSON_LINKEDIN_KEY,
+    ]
+
+    params = {}
+    # nur setzen, wenn field_key selbst ein custom field ist oder wir allgemein die UI Felder brauchen
+    if field_key in needed_custom_fields:
+        params["custom_fields"] = ",".join(needed_custom_fields)
+    else:
+        # trotzdem sinnvoll: wir lassen es leer, um Response klein zu halten
+        pass
+
+    persons = await fetch_all_v2("persons", headers=headers, params=params)
+
     bad = []
     for p in persons:
-        v = p.get(field_key)
+        v = pd_get_value_v2(p, field_key)
         if _is_missing(v):
             bad.append(
                 {
                     "id": p.get("id"),
-                    "display_name": p.get("name") or f"{_scalarize(p.get('first_name'))} {_scalarize(p.get('last_name'))}".strip(),
-                    "current_value": _scalarize(v),
+                    "first_name": _scalarize(pd_get_value_v2(p, "first_name")),
+                    "last_name": _scalarize(pd_get_value_v2(p, "last_name")),
                 }
             )
     return bad
+
 
 
 async def _dq_scan_contacts_invalidchars(field_key: str) -> list[dict]:
@@ -968,43 +1469,61 @@ async def _dq_scan_contacts_invalidchars(field_key: str) -> list[dict]:
     if not headers:
         raise RuntimeError("Nicht eingeloggt")
 
-    persons = await fetch_all_v2("persons", headers=headers)
+    # first_name / last_name sind Root-Felder → keine custom_fields nötig
+    persons = await fetch_all_v2("persons", headers=headers, params={"limit": 500})
+
     bad = []
     for p in persons:
-        v = _scalarize(p.get(field_key)).strip()
+        v = _scalarize(pd_get_value_v2(p, field_key)).strip()
         if not v:
             continue
         if _has_invalid_name_chars(v):
             bad.append(
                 {
                     "id": p.get("id"),
-                    "display_name": p.get("name") or f"{_scalarize(p.get('first_name'))} {_scalarize(p.get('last_name'))}".strip(),
-                    "current_value": v,
+                    "first_name": _scalarize(pd_get_value_v2(p, "first_name")),
+                    "last_name": _scalarize(pd_get_value_v2(p, "last_name")),
                 }
             )
     return bad
-
 
 async def _dq_scan_contacts_title_in_first_name() -> list[dict]:
     headers = get_headers()
     if not headers:
         raise RuntimeError("Nicht eingeloggt")
 
-    persons = await fetch_all_v2("persons", headers=headers)
+    persons = await fetch_all_v2("persons", headers=headers, params={"limit": 500})
+
     bad = []
     for p in persons:
-        v = _scalarize(p.get("first_name")).strip()
+        v = _scalarize(pd_get_value_v2(p, "first_name")).strip()
         if not v:
             continue
         if TITLE_PREFIX_REGEX.search(v):
             bad.append(
                 {
                     "id": p.get("id"),
-                    "display_name": p.get("name") or f"{_scalarize(p.get('first_name'))} {_scalarize(p.get('last_name'))}".strip(),
-                    "current_value": v,
+                    "first_name": _scalarize(pd_get_value_v2(p, "first_name")),
+                    "last_name": _scalarize(pd_get_value_v2(p, "last_name")),
                 }
             )
     return bad
+
+async def pipedrive_patch_v2(entity: str, entity_id: int, payload: dict, headers: dict) -> dict:
+    """
+    v2 Update: PATCH /api/v2/persons/{id} bzw. /api/v2/organizations/{id} :contentReference[oaicite:9]{index=9}
+    """
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        r = await client.patch(
+            f"{PIPEDRIVE_API_V2_URL}/{entity}/{entity_id}",
+            headers=headers,
+            json=payload,
+        )
+        if r.status_code in (200, 201):
+            return r.json()
+
+        raise RuntimeError(f"Update fehlgeschlagen ({r.status_code}): {r.text}")
+
 
 
 def _render_results_table(
@@ -1624,10 +2143,16 @@ async def dq_update(payload: dict = Body(...)):
         return {"ok": False, "error": "field_key fehlt"}
 
     headers = get_headers()
+    if not headers:
+        return JSONResponse({"ok": False, "error": "Nicht eingeloggt"}, status_code=401)
+
     entity_endpoint = "persons" if entity_type == "person" else "organizations"
 
+    # v2 payload bauen
+    patch_fragment = normalize_person_update_payload_v2(field_key, value)
+
     try:
-        result = await pipedrive_update_v2(entity_endpoint, entity_id, {field_key: value}, headers)
+        result = await pipedrive_patch_v2(entity_endpoint, entity_id, patch_fragment, headers)
         return {"ok": True, "result": result.get("data") or result}
     except Exception as e:
         return {"ok": False, "error": str(e)}
