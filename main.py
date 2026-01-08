@@ -1084,52 +1084,50 @@ async def collect_bad_persons(
     return bad, cursor
 
 @app.get("/dq/contacts/first_name/missing", response_class=HTMLResponse)
-async def dq_contacts_first_name_missing(cursor: str | None = None, page_size: int = 200):
+async def dq_first_name_missing_db(after_id: int = 0, limit: int = 200):
     if "default" not in user_tokens:
         return RedirectResponse("/login")
+    if not db_pool:
+        return HTMLResponse("DB nicht initialisiert (DATABASE_URL fehlt)", status_code=500)
 
-    headers = get_headers()
-    if not headers:
-        return RedirectResponse("/login")
+    limit = max(50, min(int(limit), 500))
 
-    def pred(p: dict) -> bool:
-        v = p.get("first_name")
-        return v is None or (isinstance(v, str) and v.strip() == "")
+    sql = """
+    SELECT id, first_name, last_name
+    FROM persons_cache
+    WHERE (first_name IS NULL OR btrim(first_name) = '')
+      AND id > $1
+    ORDER BY id
+    LIMIT $2
+    """
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch(sql, after_id, limit)
 
-    persons, next_cursor = await collect_bad_persons(
-        headers=headers,
-        page_size=page_size,
-        start_cursor=cursor,
-        predicate=pred,
-        need_custom_keys=[],  # hier brauchen wir keine custom fields
-    )
-
-    # table rows
     trs = []
-    for p in persons:
-        pid = p.get("id")
-        fn = html_escape(str(p.get("first_name") or ""))
-        ln = html_escape(str(p.get("last_name") or ""))
+    last_id = after_id
+    for r in rows:
+        pid = int(r["id"])
+        last_id = pid
+        fn = (r["first_name"] or "").strip() or "-"
+        ln = (r["last_name"] or "").strip() or "-"
         trs.append(f"""
           <tr>
             <td><code class="badge">{pid}</code></td>
-            <td>{fn}</td>
-            <td>{ln}</td>
-            <td>
-              <a class="btn btn-sm btn-primary" href="/dq/contacts/person/{pid}">Öffnen</a>
-            </td>
+            <td>{html_escape(fn)}</td>
+            <td>{html_escape(ln)}</td>
+            <td style="width:160px;"><a class="chip" href="/dq/contacts/person/{pid}">Öffnen</a></td>
           </tr>
         """)
 
     next_link = ""
-    if next_cursor:
-        next_link = f'<a class="btn btn-outline" href="/dq/contacts/first_name/missing?cursor={html_escape(next_cursor)}&page_size={page_size}">Weiter →</a>'
+    if rows:
+        next_link = f'<a class="btn btn-outline" href="/dq/contacts/first_name/missing?after_id={last_id}&limit={limit}">Weiter →</a>'
 
     body = f"""
       <div class="topbar">
         <div>
           <div class="title">Vorname – Fehlende Daten</div>
-          <div class="subtitle">Page size: {page_size}</div>
+          <div class="subtitle">Liste aus Cache-DB · Page size: {limit}</div>
         </div>
         <div style="display:flex; gap:10px;">
           <a class="btn btn-outline" href="/overview">← Zur Übersicht</a>
@@ -1148,12 +1146,13 @@ async def dq_contacts_first_name_missing(cursor: str | None = None, page_size: i
             </tr>
           </thead>
           <tbody>
-            {''.join(trs) if trs else '<tr><td colspan="4">✅ Keine Treffer.</td></tr>'}
+            {''.join(trs) if trs else '<tr><td colspan="4">✅ Keine Treffer (oder Cache noch nicht vollständig).</td></tr>'}
           </tbody>
         </table>
       </div>
     """
     return HTMLResponse(page_shell("Vorname – Fehlende Daten", body))
+
 
 ########################################################################
 #
