@@ -158,22 +158,6 @@ async def set_sync_cursor(entity: str, cursor: Optional[str], in_progress: bool)
         """, entity, cursor, in_progress)
 
 
-async def get_sync_cursor(entity: str) -> tuple[Optional[str], bool]:
-    async with db_pool.acquire() as conn:
-        row = await conn.fetchrow("SELECT last_cursor, full_in_progress FROM sync_state WHERE entity=$1", entity)
-        if not row:
-            return None, False
-        return row["last_cursor"], bool(row["full_in_progress"])
-
-
-async def set_sync_cursor(entity: str, cursor: Optional[str], in_progress: bool):
-    async with db_pool.acquire() as conn:
-        await conn.execute("""
-            UPDATE sync_state
-            SET last_cursor=$2, full_in_progress=$3
-            WHERE entity=$1
-        """, entity, cursor, in_progress)
-
 @app.on_event("startup")
 async def _startup():
     global db_pool
@@ -540,39 +524,6 @@ def _has_invalid_name_chars(text: str) -> bool:
     return NAME_ALLOWED_REGEX.match(t) is None
 
 
-async def fetch_all_v2(endpoint: str, headers: dict, params: Optional[dict] = None) -> list[dict]:
-    """Cursor-basierte Pagination (v2) – gibt alle items als Liste zurück."""
-    if params is None:
-        params = {}
-
-    out: list[dict] = []
-    limit = int(params.get("limit") or 500)
-    cursor = None
-
-    async with httpx.AsyncClient(timeout=60.0) as client:
-        while True:
-            p = dict(params)
-            p["limit"] = limit
-            if cursor:
-                p["cursor"] = cursor
-
-            resp = await client.get(f"{PIPEDRIVE_API_V2_URL}/{endpoint}", headers=headers, params=p)
-            if resp.status_code != 200:
-                raise RuntimeError(f"Pipedrive API Fehler ({resp.status_code}): {resp.text}")
-
-            data = resp.json() or {}
-            items = data.get("data") or []
-            if not items:
-                break
-
-            out.extend(items)
-            cursor = (data.get("additional_data") or {}).get("next_cursor")
-            if not cursor:
-                break
-
-    return out
-
-
 async def pipedrive_update_v2(entity: str, entity_id: int, payload: dict, headers: dict) -> dict:
     """
     Update helper: v2 ist je nach Endpoint PATCH oder PUT.
@@ -676,18 +627,25 @@ async def upsert_persons(batch: list[dict]) -> Optional[datetime]:
         if ts and (max_ts is None or ts > max_ts):
             max_ts = ts
 
+        custom = p.get("custom_fields") or {}
+
+        email_primary = _primary_from_list(p.get("emails"))  # v2: emails (list of objects)
+
+        gender_id = custom.get(PD_PERSON_GENDER_KEY)
+        du_sie_id = custom.get(PD_PERSON_DU_SIE_KEY)
+
         rows.append((
             int(pid),
             _scalarize(p.get("first_name")).strip(),
             _scalarize(p.get("last_name")).strip(),
-            _scalarize(p.get(PD_PERSON_GENDER_KEY)).strip(),
-            _email_first(p),
-            _scalarize(p.get(PD_PERSON_DU_SIE_KEY)).strip(),
-            _scalarize(p.get(PD_PERSON_POSITION_KEY)).strip(),
-            _scalarize(p.get(PD_PERSON_LINKEDIN_KEY)).strip(),
+            (str(gender_id) if gender_id is not None else ""),   # store option id as string
+            email_primary,
+            (str(du_sie_id) if du_sie_id is not None else ""),   # store option id as string
+            _scalarize(custom.get(PD_PERSON_POSITION_KEY)).strip(),
+            _scalarize(custom.get(PD_PERSON_LINKEDIN_KEY)).strip(),
             _get_org_id_from_person(p),
             ts,
-            _label_ids_list(p),
+            _label_ids_list(p),  # v2: label_ids is root field (list[int])
         ))
 
     if not rows:
@@ -755,18 +713,28 @@ async def upsert_orgs(batch: list[dict]) -> Optional[datetime]:
 
     return max_ts
 
-
 async def sync_persons_incremental(full: bool = False, max_pages: int = 20) -> dict:
     headers = get_headers()
     if not headers:
         raise RuntimeError("Nicht eingeloggt")
 
-    params = {"limit": 500}
+    # Wir wollen diese Custom Fields im Cache haben:
+    custom_keys = [
+        PD_PERSON_GENDER_KEY,
+        PD_PERSON_DU_SIE_KEY,
+        PD_PERSON_POSITION_KEY,
+        PD_PERSON_LINKEDIN_KEY,
+    ]
 
-    cursor = None
+    params = {
+        "limit": 500,
+        # v2: custom_fields als comma-separated string
+        "custom_fields": ",".join(custom_keys),
+    }
+
+    cursor: Optional[str] = None
     if full:
         cursor, in_progress = await get_sync_cursor("persons")
-        # wenn kein Cursor gespeichert: neuer Initial-Lauf
         if not in_progress:
             await set_sync_cursor("persons", None, True)
             cursor = None
@@ -784,11 +752,11 @@ async def sync_persons_incremental(full: bool = False, max_pages: int = 20) -> d
             if cursor:
                 p["cursor"] = cursor
 
-            resp = await client.get(f"{PIPEDRIVE_API_V2_URL}/persons", headers=headers, params=p)
-            if resp.status_code != 200:
-                raise RuntimeError(f"Pipedrive API Fehler ({resp.status_code}): {resp.text}")
+            r = await client.get(f"{PIPEDRIVE_API_V2_URL}/persons", headers=headers, params=p)
+            if r.status_code != 200:
+                raise RuntimeError(f"Pipedrive API Fehler ({r.status_code}): {r.text}")
 
-            payload = resp.json() or {}
+            payload = r.json() or {}
             items = payload.get("data") or []
             add = payload.get("additional_data") or {}
             next_cursor = add.get("next_cursor")
@@ -802,7 +770,6 @@ async def sync_persons_incremental(full: bool = False, max_pages: int = 20) -> d
             cursor = next_cursor
             pages += 1
 
-            # Cursor speichern, damit der nächste Klick weitermacht
             if full:
                 await set_sync_cursor("persons", cursor, True)
 
@@ -811,11 +778,9 @@ async def sync_persons_incremental(full: bool = False, max_pages: int = 20) -> d
             if not cursor:
                 break
 
-    # Sync-Time nur bei inkrementell relevant (und optional auch bei full)
     if max_seen:
         await set_sync_time("persons", max_seen)
 
-    # Wenn full fertig (cursor None), dann Initial-Mode beenden
     if full and not cursor:
         await set_sync_cursor("persons", None, False)
 
@@ -826,20 +791,8 @@ async def sync_persons_incremental(full: bool = False, max_pages: int = 20) -> d
         "processed": total,
         "pages": pages,
         "cursor_remaining": bool(cursor),
-        "new_sync_time": max_seen.isoformat() if max_seen else None
+        "new_sync_time": max_seen.isoformat() if max_seen else None,
     }
-
-
-    async for items in iter_v2_pages("persons", headers=headers, params=params, max_pages=max_pages):
-        total += len(items)
-        ts = await upsert_persons(items)
-        if ts and (max_seen is None or ts > max_seen):
-            max_seen = ts
-
-    if max_seen:
-        await set_sync_time("persons", max_seen)
-
-    return {"entity": "persons", "full": full, "max_pages": max_pages, "processed": total, "new_sync_time": max_seen.isoformat() if max_seen else None}
 
 
 async def sync_orgs_incremental(full: bool = False, max_pages: int = 20) -> dict:
@@ -1246,98 +1199,6 @@ def _render_cards(group: str) -> str:
     """
 
 
-@app.get("/dq/contacts/person/{person_id}", response_class=HTMLResponse)
-async def dq_contact_edit(person_id: int):
-    if "default" not in user_tokens:
-        return RedirectResponse("/login")
-
-    headers = get_headers()
-    p = await pipedrive_get_person_v2(person_id, headers)
-
-    custom = p.get("custom_fields") or {}
-    gender_val = custom.get(PD_PERSON_GENDER_KEY)
-    dusie_val = custom.get(PD_PERSON_DU_SIE_KEY)
-
-    gender_opts = await get_enum_options(PD_PERSON_GENDER_KEY, headers)
-    dusie_opts = await get_enum_options(PD_PERSON_DU_SIE_KEY, headers)
-
-    # v2: emails ist Liste
-    email_primary = _primary_from_list(p.get("emails"))
-
-    body = f"""
-      <div class="topbar">
-        <div>
-          <div class="title">Kontakt bearbeiten</div>
-          <div class="subtitle"><code class="badge">{person_id}</code></div>
-        </div>
-        <div style="display:flex; gap:10px;">
-          <a class="btn btn-outline" href="/dq/contacts/first_name/missing">← Zur Liste</a>
-        </div>
-      </div>
-
-      <div class="panel">
-        <div style="display:grid; grid-template-columns: 220px 1fr; gap:10px; align-items:center;">
-          <div class="small">Vorname</div>
-          <input class="field-input" id="first_name" value="{html_escape(str(p.get("first_name") or ""))}"/>
-
-          <div class="small">Nachname</div>
-          <input class="field-input" id="last_name" value="{html_escape(str(p.get("last_name") or ""))}"/>
-
-          <div class="small">Geschlecht</div>
-          {_render_select("gender", gender_opts, gender_val)}
-
-          <div class="small">E-Mail-Adresse (primary)</div>
-          <input class="field-input" id="email_primary" value="{html_escape(email_primary)}"/>
-
-          <div class="small">Du oder Sie</div>
-          {_render_select("dusie", dusie_opts, dusie_val)}
-
-          <div class="small">Position</div>
-          <input class="field-input" id="position" value="{html_escape(str(custom.get(PD_PERSON_POSITION_KEY) or ""))}"/>
-
-          <div class="small">LinkedIn-URL</div>
-          <input class="field-input" id="linkedin" value="{html_escape(str(custom.get(PD_PERSON_LINKEDIN_KEY) or ""))}"/>
-        </div>
-
-        <div style="margin-top:16px;">
-          <button class="btn btn-primary" onclick="savePerson()">Speichern</button>
-        </div>
-      </div>
-
-      <script>
-        async function savePerson(){{
-          const genderSelect = document.querySelector('select[name="gender"]');
-          const dusieSelect = document.querySelector('select[name="dusie"]');
-
-          const payload = {{
-            person_id: {person_id},
-            first_name: document.getElementById("first_name").value || "",
-            last_name: document.getElementById("last_name").value || "",
-            email_primary: document.getElementById("email_primary").value || "",
-            gender_id: genderSelect ? genderSelect.value : "",
-            dusie_id: dusieSelect ? dusieSelect.value : "",
-            position: document.getElementById("position").value || "",
-            linkedin: document.getElementById("linkedin").value || "",
-          }};
-
-          const res = await fetch("/dq/contacts/person/save", {{
-            method:"POST",
-            headers:{{"Content-Type":"application/json"}},
-            body: JSON.stringify(payload)
-          }});
-
-          const data = await res.json();
-          if(data.ok) {{
-            alert("✅ Gespeichert.");
-            location.reload();
-          }} else {{
-            alert("❌ Fehler: " + (data.error || "Unbekannt"));
-          }}
-        }}
-      </script>
-    """
-    return HTMLResponse(page_shell("Kontakt bearbeiten", body))
-
 
 @app.post("/dq/contacts/person/save")
 async def dq_contact_save(payload: dict = Body(...)):
@@ -1693,76 +1554,6 @@ async def db_update_person_cache(person_id: int, data: dict):
 
 
 
-@app.get("/dq/contacts/first_name/missing", response_class=HTMLResponse)
-async def dq_first_name_missing_db(after_id: int = 0, limit: int = 200):
-    if "default" not in user_tokens:
-        return RedirectResponse("/login")
-    if not db_pool:
-        return HTMLResponse("DB nicht initialisiert (DATABASE_URL fehlt)", status_code=500)
-
-    limit = max(50, min(int(limit), 500))
-
-    sql = """
-    SELECT id, first_name, last_name
-    FROM persons_cache
-    WHERE (first_name IS NULL OR btrim(first_name) = '')
-      AND id > $1
-    ORDER BY id
-    LIMIT $2
-    """
-    async with db_pool.acquire() as conn:
-        rows = await conn.fetch(sql, after_id, limit)
-
-    trs = []
-    last_id = after_id
-    for r in rows:
-        pid = int(r["id"])
-        last_id = pid
-        fn = (r["first_name"] or "").strip() or "-"
-        ln = (r["last_name"] or "").strip() or "-"
-        trs.append(f"""
-          <tr>
-            <td><code class="badge">{pid}</code></td>
-            <td>{html_escape(fn)}</td>
-            <td>{html_escape(ln)}</td>
-            <td style="width:160px;"><a class="chip" href="/dq/contacts/person/{pid}">Öffnen</a></td>
-          </tr>
-        """)
-
-    next_link = ""
-    if rows:
-        next_link = f'<a class="btn btn-outline" href="/dq/contacts/first_name/missing?after_id={last_id}&limit={limit}">Weiter →</a>'
-
-    body = f"""
-      <div class="topbar">
-        <div>
-          <div class="title">Vorname – Fehlende Daten</div>
-          <div class="subtitle">Liste aus Cache-DB · Page size: {limit}</div>
-        </div>
-        <div style="display:flex; gap:10px;">
-          <a class="btn btn-outline" href="/overview">← Zur Übersicht</a>
-          {next_link}
-        </div>
-      </div>
-
-      <div class="panel">
-        <table>
-          <thead>
-            <tr>
-              <th style="width:120px;">ID</th>
-              <th>Vorname</th>
-              <th>Nachname</th>
-              <th style="width:160px;">Aktion</th>
-            </tr>
-          </thead>
-          <tbody>
-            {''.join(trs) if trs else '<tr><td colspan="4">✅ Keine Treffer (oder Sync noch nicht gelaufen).</td></tr>'}
-          </tbody>
-        </table>
-      </div>
-    """
-    return HTMLResponse(page_shell("Vorname – Fehlende Daten", body))
-
 
 @app.get("/dq/contacts/first_name/invalidchars", response_class=HTMLResponse)
 async def dq_first_name_invalidchars_db(after_id: int = 0, limit: int = 200):
@@ -1862,30 +1653,36 @@ async def get_person_labels(headers: dict) -> dict[int, str]:
 
 _field_options_cache: dict[str, list[tuple[str, str]]] = {}
 
+_field_options_cache_v2: dict[str, list[tuple[str, str]]] = {}
+
 async def get_person_field_options(headers: dict, field_key: str) -> list[tuple[str, str]]:
-    if field_key in _field_options_cache:
-        return _field_options_cache[field_key]
+    """
+    v2: GET /api/v2/personFields/{field_code} -> data.options[]
+    Wir cachen lokal im Prozess.
+    """
+    if field_key in _field_options_cache_v2:
+        return _field_options_cache_v2[field_key]
 
-    url = "https://api.pipedrive.com/v1/personFields"
     async with httpx.AsyncClient(timeout=30.0) as client:
-        r = await client.get(url, headers=headers)
-        if r.status_code != 200:
-            _field_options_cache[field_key] = []
-            return []
+        r = await client.get(f"{PIPEDRIVE_API_V2_URL}/personFields/{field_key}", headers=headers)
 
-        fields = (r.json() or {}).get("data") or []
-        opts: list[tuple[str, str]] = []
-        for f in fields:
-            if f.get("key") == field_key:
-                for o in (f.get("options") or []):
-                    oid = o.get("id")
-                    label = o.get("label") or o.get("name") or ""
-                    if oid is not None and label:
-                        opts.append((str(oid), str(label)))
-                break
+    if r.status_code != 200:
+        _field_options_cache_v2[field_key] = []
+        return []
 
-        _field_options_cache[field_key] = opts
-        return opts
+    data = (r.json() or {}).get("data") or {}
+    options = data.get("options") or []
+
+    out: list[tuple[str, str]] = []
+    for o in options:
+        oid = o.get("id")
+        label = o.get("label") or o.get("name") or ""
+        if oid is not None:
+            out.append((str(oid), str(label)))
+
+    _field_options_cache_v2[field_key] = out
+    return out
+
 
 @app.get("/dq/contacts/person/{person_id}", response_class=HTMLResponse)
 async def dq_person_detail_db(person_id: int, saved: int = 0):
@@ -2005,36 +1802,53 @@ async def dq_person_update_db(person_id: int, payload: dict = Body(...)):
         return JSONResponse({"ok": False, "error": "Nicht eingeloggt"}, status_code=401)
 
     headers = get_headers()
+    if not headers:
+        return JSONResponse({"ok": False, "error": "Nicht eingeloggt"}, status_code=401)
 
-    pd_payload = {
-        "first_name": (payload.get("first_name") or "").strip(),
-        "last_name": (payload.get("last_name") or "").strip(),
-        PD_PERSON_GENDER_KEY: (payload.get("gender") or "").strip(),
-        PD_PERSON_DU_SIE_KEY: (payload.get("du_sie") or "").strip(),
-        PD_PERSON_POSITION_KEY: (payload.get("position") or "").strip(),
-        PD_PERSON_LINKEDIN_KEY: (payload.get("linkedin_url") or "").strip(),
+    first_name = (payload.get("first_name") or "").strip()
+    last_name = (payload.get("last_name") or "").strip()
+    email = (payload.get("email") or "").strip()
+
+    gender_id = (payload.get("gender") or "").strip()     # option id als string
+    du_sie_id = (payload.get("du_sie") or "").strip()     # option id als string
+
+    position = (payload.get("position") or "").strip()
+    linkedin = (payload.get("linkedin_url") or "").strip()
+
+    patch = {
+        "first_name": first_name if first_name != "" else None,
+        "last_name": last_name if last_name != "" else None,
+        "emails": ([{"label": "work", "value": email, "primary": True}] if email else []),
+        "custom_fields": {
+            PD_PERSON_GENDER_KEY: (int(gender_id) if gender_id.isdigit() else None),
+            PD_PERSON_DU_SIE_KEY: (int(du_sie_id) if du_sie_id.isdigit() else None),
+            PD_PERSON_POSITION_KEY: (position if position != "" else None),
+            PD_PERSON_LINKEDIN_KEY: (linkedin if linkedin != "" else None),
+        },
     }
 
-    email = (payload.get("email") or "").strip()
-    pd_payload["email"] = [{"value": email, "primary": True}] if email else []
+    # Optional: None Felder rauswerfen (sauberer PATCH)
+    patch["custom_fields"] = {k: v for k, v in patch["custom_fields"].items() if v is not None}
 
     try:
-        await pipedrive_update_v2("persons", person_id, pd_payload, headers)
+        await pipedrive_patch_v2("persons", person_id, patch, headers)
 
+        # Cache nachziehen (DB)
         if db_pool:
             await db_update_person_cache(person_id, {
-                "first_name": pd_payload["first_name"],
-                "last_name": pd_payload["last_name"],
-                "gender": pd_payload[PD_PERSON_GENDER_KEY],
+                "first_name": first_name,
+                "last_name": last_name,
+                "gender": (gender_id if gender_id else ""),
                 "email": email,
-                "du_sie": pd_payload[PD_PERSON_DU_SIE_KEY],
-                "position": pd_payload[PD_PERSON_POSITION_KEY],
-                "linkedin_url": pd_payload[PD_PERSON_LINKEDIN_KEY],
+                "du_sie": (du_sie_id if du_sie_id else ""),
+                "position": position,
+                "linkedin_url": linkedin,
             })
 
         return JSONResponse({"ok": True})
     except Exception as e:
         return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
+
 
 
 ########################################################################
