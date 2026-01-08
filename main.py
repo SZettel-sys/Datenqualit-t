@@ -1294,6 +1294,38 @@ async def dq_update(payload: dict = Body(...)):
 # ENDPUNKTE DB
 #
 ########################################################################
+@app.get("/admin", response_class=HTMLResponse)
+async def admin_page():
+    if "default" not in user_tokens:
+        return RedirectResponse("/login")
+
+    body = """
+    <div class="topbar">
+      <div>
+        <div class="title">Admin – Sync</div>
+        <div class="subtitle">Starte Sync-Jobs in Batches (perfekt für große Datenmengen).</div>
+      </div>
+      <div style="display:flex; gap:10px;">
+        <a class="btn btn-outline" href="/overview">← Zur Übersicht</a>
+      </div>
+    </div>
+
+    <div class="panel">
+      <div style="display:flex; flex-wrap:wrap; gap:10px;">
+        <a class="btn btn-primary" href="/admin/sync?entity=organizations&full=1&max_pages=50">Initial: Orgs (50 Seiten)</a>
+        <a class="btn btn-primary" href="/admin/sync?entity=persons&full=1&max_pages=50">Initial: Persons (50 Seiten)</a>
+        <a class="btn btn-outline" href="/admin/sync?entity=organizations&full=0&max_pages=20">Inkrementell: Orgs</a>
+        <a class="btn btn-outline" href="/admin/sync?entity=persons&full=0&max_pages=20">Inkrementell: Persons</a>
+        <a class="btn btn-outline" href="/admin/sync/status">Status</a>
+      </div>
+
+      <div style="margin-top:12px;" class="small">
+        Tipp: Für Initial-Sync mehrfach klicken, bis bei <b>processed</b> keine neuen Datensätze mehr kommen.
+      </div>
+    </div>
+    """
+    return HTMLResponse(page_shell("Admin – Sync", body))
+
 @app.get("/admin/sync")
 async def admin_sync(entity: str = "persons", full: int = 0, max_pages: int = 20):
     if "default" not in user_tokens:
