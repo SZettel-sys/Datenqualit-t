@@ -305,6 +305,8 @@ def extract_address(address_value):
 ########################################################################
 
 CSS_VERSION = "1"  # hochzählen, wenn du CSS änderst (Cache-Busting)
+FREELANCER_ORG_NAME = "Freelancer"
+
 
 # Kontakt-Feldkeys
 PD_PERSON_GENDER_KEY = "c4f5f434cdb0cfce3f6d62ec7291188fe968ac72"
@@ -385,6 +387,64 @@ DQ_CARDS = [
         "description": "",
         "actions": [
             {"label": "Fehlende Daten", "href": "/dq/contacts/linkedin/missing"},
+        ],
+    },
+
+    # Freelancer
+    {
+        "group": "Freelancer",
+        "title": "Vorname",
+        "description": "Organisation = Freelancer",
+        "actions": [
+            {"label": "Fehlende Daten", "href": "/dq/freelancers/first_name/missing"},
+        ],
+    },
+    {
+        "group": "Freelancer",
+        "title": "Nachname",
+        "description": "Organisation = Freelancer",
+        "actions": [
+            {"label": "Fehlende Daten", "href": "/dq/freelancers/last_name/missing"},
+        ],
+    },
+    {
+        "group": "Freelancer",
+        "title": "Geschlecht",
+        "description": "Organisation = Freelancer",
+        "actions": [
+            {"label": "Fehlende Daten", "href": "/dq/freelancers/gender/missing"},
+        ],
+    },
+    {
+        "group": "Freelancer",
+        "title": "E-Mail-Adresse",
+        "description": "Organisation = Freelancer",
+        "actions": [
+            {"label": "Fehlende Daten", "href": "/dq/freelancers/email/missing"},
+        ],
+    },
+    {
+        "group": "Freelancer",
+        "title": "Du oder Sie",
+        "description": "Organisation = Freelancer",
+        "actions": [
+            {"label": "Fehlende Daten", "href": "/dq/freelancers/du_sie/missing"},
+        ],
+    },
+    {
+        "group": "Freelancer",
+        "title": "Position",
+        "description": "Organisation = Freelancer",
+        "actions": [
+            {"label": "Fehlende Daten", "href": "/dq/freelancers/position/missing"},
+        ],
+    },
+    {
+        "group": "Freelancer",
+        "title": "LinkedIn-URL",
+        "description": "Organisation = Freelancer",
+        "actions": [
+            {"label": "Fehlende Daten", "href": "/dq/freelancers/linkedin/missing"},
         ],
     },
 
@@ -1585,7 +1645,7 @@ async def overview(request: Request):
       <div class="topbar">
         <div>
           <div class="title">Datenqualität – Übersicht</div>
-          <div class="subtitle">Wähle eine Prüfung aus (Kontakte & Organisationen).</div>
+          <div class="subtitle">Wähle eine Prüfung aus (Kontakte, Freelancer & Organisationen).</div>
         </div>
         <div style="display:flex; gap:10px; align-items:center;">
           <a class="btn btn-outline" href="/logout">Logout</a>
@@ -1593,9 +1653,11 @@ async def overview(request: Request):
       </div>
 
       {_render_cards("Kontakte")}
+      {_render_cards("Freelancer")}
       {_render_cards("Organisationen")}
     """
     return HTMLResponse(page_shell("Datenqualität – Übersicht", body))
+
 
 
 @app.get("/logout")
@@ -2170,19 +2232,83 @@ async def dq_last_name_invalidchars_db(after_id: int = 0, limit: int = 200):
     """
     return HTMLResponse(page_shell("Nachname – Ungültige Zeichen", body))
 
-def _dq_missing_sql_for_column(col: str) -> str:
-    return f"""
-    SELECT id, first_name, last_name
-    FROM persons_cache
-    WHERE ({col} IS NULL OR btrim({col}) = '')
-      AND id > $1
-    ORDER BY id
-    LIMIT $2
+def _freelancer_filter_sql(mode: str) -> str:
     """
+    mode:
+      - "only": nur Freelancer (org.name = FREELANCER_ORG_NAME)
+      - "exclude": alles außer Freelancer
+      - "all": keine Filterung
+    """
+    if mode == "all":
+        return ""
 
-async def _render_missing_list(title: str, base_path: str, after_id: int, limit: int, sql: str) -> HTMLResponse:
+    # persons_cache.org_id -> orgs_cache.id
+    # Achtung: org_id kann NULL sein; bei exclude wollen wir die behalten.
+    if mode == "only":
+        return """
+          AND EXISTS (
+            SELECT 1 FROM orgs_cache o
+            WHERE o.id = persons_cache.org_id
+              AND lower(o.name) = lower($3)
+          )
+        """
+    if mode == "exclude":
+        return """
+          AND NOT EXISTS (
+            SELECT 1 FROM orgs_cache o
+            WHERE o.id = persons_cache.org_id
+              AND lower(o.name) = lower($3)
+          )
+        """
+    return ""
+
+def _dq_missing_sql_for_column(col: str, freelancer_mode: str = "exclude") -> str:
+    """
+    freelancer_mode:
+      - "exclude" = Kontakte ohne Freelancer (Default)
+      - "only"    = nur Freelancer
+      - "all"     = keine Filterung
+    """
+    flt = _freelancer_filter_sql(freelancer_mode)
+
+    # Parameter:
+    # $1 = after_id, $2 = limit, $3 = FREELANCER_ORG_NAME (nur wenn flt != "")
+    if flt.strip():
+        return f"""
+        SELECT id, first_name, last_name
+        FROM persons_cache
+        WHERE ({col} IS NULL OR btrim({col}) = '')
+          AND id > $1
+        {flt}
+        ORDER BY id
+        LIMIT $2
+        """
+    else:
+        return f"""
+        SELECT id, first_name, last_name
+        FROM persons_cache
+        WHERE ({col} IS NULL OR btrim({col}) = '')
+          AND id > $1
+        ORDER BY id
+        LIMIT $2
+        """
+
+async def _render_missing_list(
+    title: str,
+    base_path: str,
+    after_id: int,
+    limit: int,
+    sql: str,
+    freelancer_mode: str = "exclude",
+) -> HTMLResponse:
+    """
+    Wenn freelancer_mode != "all", erwartet das SQL ein $3 mit FREELANCER_ORG_NAME.
+    """
     async with db_pool.acquire() as conn:
-        rows = await conn.fetch(sql, after_id, limit)
+        if freelancer_mode in ("only", "exclude"):
+            rows = await conn.fetch(sql, after_id, limit, FREELANCER_ORG_NAME)
+        else:
+            rows = await conn.fetch(sql, after_id, limit)
 
     trs = []
     last_id = after_id
@@ -2204,11 +2330,13 @@ async def _render_missing_list(title: str, base_path: str, after_id: int, limit:
     if rows:
         next_link = f'<a class="btn btn-outline" href="{base_path}?after_id={last_id}&limit={limit}">Weiter →</a>'
 
+    subtitle = "Kontakte (ohne Freelancer)" if freelancer_mode == "exclude" else ("Nur Freelancer" if freelancer_mode == "only" else "Alle Kontakte")
+
     body = f"""
       <div class="topbar">
         <div>
           <div class="title">{title}</div>
-          <div class="subtitle">Liste aus Cache-DB · Page size: {limit}</div>
+          <div class="subtitle">{subtitle} · Liste aus Cache-DB · Page size: {limit}</div>
         </div>
         <div style="display:flex; gap:10px;">
           <a class="btn btn-outline" href="/overview">← Zur Übersicht</a>
@@ -2233,6 +2361,9 @@ async def _render_missing_list(title: str, base_path: str, after_id: int, limit:
       </div>
     """
     return HTMLResponse(page_shell(title, body))
+
+
+
 
 @app.get("/dq/contacts/gender/missing", response_class=HTMLResponse)
 async def dq_gender_missing_db(after_id: int = 0, limit: int = 200):
@@ -2278,6 +2409,90 @@ async def dq_linkedin_missing_db(after_id: int = 0, limit: int = 200):
         return HTMLResponse("DB nicht initialisiert", status_code=500)
     limit = max(50, min(int(limit), 500))
     return await _render_missing_list("LinkedIn-URL – Fehlende Daten", "/dq/contacts/linkedin/missing", after_id, limit, _dq_missing_sql_for_column("linkedin_url"))
+
+@app.get("/dq/freelancers/first_name/missing", response_class=HTMLResponse)
+async def dq_freelancers_first_name_missing(after_id: int = 0, limit: int = 200):
+    if "default" not in user_tokens:
+        return RedirectResponse("/login")
+    if not db_pool:
+        return HTMLResponse("DB nicht initialisiert", status_code=500)
+
+    limit = max(50, min(int(limit), 500))
+    sql = _dq_missing_sql_for_column("first_name", freelancer_mode="only")
+    return await _render_missing_list("Freelancer – Vorname (fehlend)", "/dq/freelancers/first_name/missing", after_id, limit, sql, freelancer_mode="only")
+
+
+@app.get("/dq/freelancers/last_name/missing", response_class=HTMLResponse)
+async def dq_freelancers_last_name_missing(after_id: int = 0, limit: int = 200):
+    if "default" not in user_tokens:
+        return RedirectResponse("/login")
+    if not db_pool:
+        return HTMLResponse("DB nicht initialisiert", status_code=500)
+
+    limit = max(50, min(int(limit), 500))
+    sql = _dq_missing_sql_for_column("last_name", freelancer_mode="only")
+    return await _render_missing_list("Freelancer – Nachname (fehlend)", "/dq/freelancers/last_name/missing", after_id, limit, sql, freelancer_mode="only")
+
+
+@app.get("/dq/freelancers/gender/missing", response_class=HTMLResponse)
+async def dq_freelancers_gender_missing(after_id: int = 0, limit: int = 200):
+    if "default" not in user_tokens:
+        return RedirectResponse("/login")
+    if not db_pool:
+        return HTMLResponse("DB nicht initialisiert", status_code=500)
+
+    limit = max(50, min(int(limit), 500))
+    sql = _dq_missing_sql_for_column("gender", freelancer_mode="only")
+    return await _render_missing_list("Freelancer – Geschlecht (fehlend)", "/dq/freelancers/gender/missing", after_id, limit, sql, freelancer_mode="only")
+
+
+@app.get("/dq/freelancers/email/missing", response_class=HTMLResponse)
+async def dq_freelancers_email_missing(after_id: int = 0, limit: int = 200):
+    if "default" not in user_tokens:
+        return RedirectResponse("/login")
+    if not db_pool:
+        return HTMLResponse("DB nicht initialisiert", status_code=500)
+
+    limit = max(50, min(int(limit), 500))
+    sql = _dq_missing_sql_for_column("email", freelancer_mode="only")
+    return await _render_missing_list("Freelancer – E-Mail (fehlend)", "/dq/freelancers/email/missing", after_id, limit, sql, freelancer_mode="only")
+
+
+@app.get("/dq/freelancers/du_sie/missing", response_class=HTMLResponse)
+async def dq_freelancers_du_sie_missing(after_id: int = 0, limit: int = 200):
+    if "default" not in user_tokens:
+        return RedirectResponse("/login")
+    if not db_pool:
+        return HTMLResponse("DB nicht initialisiert", status_code=500)
+
+    limit = max(50, min(int(limit), 500))
+    sql = _dq_missing_sql_for_column("du_sie", freelancer_mode="only")
+    return await _render_missing_list("Freelancer – Du/Sie (fehlend)", "/dq/freelancers/du_sie/missing", after_id, limit, sql, freelancer_mode="only")
+
+
+@app.get("/dq/freelancers/position/missing", response_class=HTMLResponse)
+async def dq_freelancers_position_missing(after_id: int = 0, limit: int = 200):
+    if "default" not in user_tokens:
+        return RedirectResponse("/login")
+    if not db_pool:
+        return HTMLResponse("DB nicht initialisiert", status_code=500)
+
+    limit = max(50, min(int(limit), 500))
+    sql = _dq_missing_sql_for_column("position", freelancer_mode="only")
+    return await _render_missing_list("Freelancer – Position (fehlend)", "/dq/freelancers/position/missing", after_id, limit, sql, freelancer_mode="only")
+
+
+@app.get("/dq/freelancers/linkedin/missing", response_class=HTMLResponse)
+async def dq_freelancers_linkedin_missing(after_id: int = 0, limit: int = 200):
+    if "default" not in user_tokens:
+        return RedirectResponse("/login")
+    if not db_pool:
+        return HTMLResponse("DB nicht initialisiert", status_code=500)
+
+    limit = max(50, min(int(limit), 500))
+    sql = _dq_missing_sql_for_column("linkedin_url", freelancer_mode="only")
+    return await _render_missing_list("Freelancer – LinkedIn (fehlend)", "/dq/freelancers/linkedin/missing", after_id, limit, sql, freelancer_mode="only")
+
 
 
 @app.get("/dq/contacts/first_name/title", response_class=HTMLResponse)
