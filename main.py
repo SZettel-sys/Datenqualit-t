@@ -61,11 +61,13 @@ def _parse_ts(v: Any) -> Optional[datetime]:
             return None
     return None
 
+
 async def init_db():
     if not db_pool:
         raise RuntimeError("db_pool ist nicht initialisiert")
 
     async with db_pool.acquire() as conn:
+        # 1) Tabellen anlegen (für frische DB)
         await conn.execute("""
         CREATE TABLE IF NOT EXISTS persons_cache (
           id BIGINT PRIMARY KEY,
@@ -101,7 +103,30 @@ async def init_db():
         );
         """)
 
-        # Personen-Indizes (schnell für DQ-Listen)
+        # 2) Schema-Migration für bestehende DBs (WICHTIG!)
+        # persons_cache
+        await conn.execute("ALTER TABLE persons_cache ADD COLUMN IF NOT EXISTS first_name TEXT;")
+        await conn.execute("ALTER TABLE persons_cache ADD COLUMN IF NOT EXISTS last_name TEXT;")
+        await conn.execute("ALTER TABLE persons_cache ADD COLUMN IF NOT EXISTS gender TEXT;")
+        await conn.execute("ALTER TABLE persons_cache ADD COLUMN IF NOT EXISTS email TEXT;")
+        await conn.execute("ALTER TABLE persons_cache ADD COLUMN IF NOT EXISTS du_sie TEXT;")
+        await conn.execute("ALTER TABLE persons_cache ADD COLUMN IF NOT EXISTS position TEXT;")
+        await conn.execute("ALTER TABLE persons_cache ADD COLUMN IF NOT EXISTS linkedin_url TEXT;")
+        await conn.execute("ALTER TABLE persons_cache ADD COLUMN IF NOT EXISTS org_id BIGINT;")
+        await conn.execute("ALTER TABLE persons_cache ADD COLUMN IF NOT EXISTS update_time TIMESTAMPTZ;")
+        await conn.execute("ALTER TABLE persons_cache ADD COLUMN IF NOT EXISTS label_ids BIGINT[];")
+
+        # orgs_cache
+        await conn.execute("ALTER TABLE orgs_cache ADD COLUMN IF NOT EXISTS name TEXT;")
+        await conn.execute("ALTER TABLE orgs_cache ADD COLUMN IF NOT EXISTS address TEXT;")
+        await conn.execute("ALTER TABLE orgs_cache ADD COLUMN IF NOT EXISTS website TEXT;")
+        await conn.execute("ALTER TABLE orgs_cache ADD COLUMN IF NOT EXISTS update_time TIMESTAMPTZ;")
+
+        # sync_state
+        await conn.execute("ALTER TABLE sync_state ADD COLUMN IF NOT EXISTS last_cursor TEXT;")
+        await conn.execute("ALTER TABLE sync_state ADD COLUMN IF NOT EXISTS full_in_progress BOOLEAN NOT NULL DEFAULT FALSE;")
+
+        # 3) Indizes (nach Migration safe)
         await conn.execute("""
         CREATE INDEX IF NOT EXISTS idx_persons_missing_first_name
         ON persons_cache (id)
@@ -149,7 +174,6 @@ async def init_db():
         ON persons_cache (org_id);
         """)
 
-        # Org-Indizes
         await conn.execute("""
         CREATE INDEX IF NOT EXISTS idx_orgs_name
         ON orgs_cache (name);
@@ -185,14 +209,20 @@ async def get_sync_cursor(entity: str) -> tuple[Optional[str], bool]:
             return None, False
         return row["last_cursor"], bool(row["full_in_progress"])
 
-
 async def set_sync_cursor(entity: str, cursor: Optional[str], in_progress: bool):
+    """
+    Wichtig: sync_state Zeile kann fehlen (alte DB / noch nie get_sync_time aufgerufen).
+    Wir legen sie per UPSERT an.
+    """
     async with db_pool.acquire() as conn:
         await conn.execute("""
-            UPDATE sync_state
-            SET last_cursor=$2, full_in_progress=$3
-            WHERE entity=$1
-        """, entity, cursor, in_progress)
+            INSERT INTO sync_state(entity, last_update_time, last_cursor, full_in_progress)
+            VALUES($1, $2, $3, $4)
+            ON CONFLICT(entity) DO UPDATE SET
+              last_cursor = EXCLUDED.last_cursor,
+              full_in_progress = EXCLUDED.full_in_progress
+        """, entity, datetime(1970, 1, 1, tzinfo=timezone.utc), cursor, in_progress)
+
 
 
 @app.on_event("startup")
@@ -2643,22 +2673,29 @@ async def admin_page():
     """
     return HTMLResponse(page_shell("Admin – Sync", body))
 
+
 @app.get("/admin/sync")
 async def admin_sync(entity: str = "persons", full: int = 0, max_pages: int = 20):
     if "default" not in user_tokens:
         return RedirectResponse("/login")
 
     if not db_pool:
-        return {"ok": False, "error": "DATABASE_URL fehlt / DB nicht initialisiert"}
+        return JSONResponse({"ok": False, "error": "DATABASE_URL fehlt / DB nicht initialisiert"}, status_code=500)
 
-    if entity == "persons":
-        res = await sync_persons_incremental(full=bool(full), max_pages=max_pages)
-        return {"ok": True, "result": res}
-    if entity in ("orgs", "organizations"):
-        res = await sync_orgs_incremental(full=bool(full), max_pages=max_pages)
-        return {"ok": True, "result": res}
+    try:
+        if entity == "persons":
+            res = await sync_persons_incremental(full=bool(full), max_pages=max_pages)
+            return {"ok": True, "result": res}
 
-    return {"ok": False, "error": "entity muss 'persons' oder 'organizations' sein"}
+        if entity in ("orgs", "organizations"):
+            res = await sync_orgs_incremental(full=bool(full), max_pages=max_pages)
+            return {"ok": True, "result": res}
+
+        return JSONResponse({"ok": False, "error": "entity muss 'persons' oder 'organizations' sein"}, status_code=400)
+
+    except Exception as e:
+        # Das ist Gold wert beim Debuggen: z.B. "column address does not exist"
+        return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
 
 
 @app.get("/admin/sync/status")
