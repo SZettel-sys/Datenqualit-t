@@ -1,5 +1,6 @@
 import os
 import re
+import unicodedata
 import json
 import httpx
 import asyncio
@@ -61,13 +62,11 @@ def _parse_ts(v: Any) -> Optional[datetime]:
             return None
     return None
 
-
 async def init_db():
     if not db_pool:
         raise RuntimeError("db_pool ist nicht initialisiert")
 
     async with db_pool.acquire() as conn:
-        # 1) Tabellen anlegen (für frische DB)
         await conn.execute("""
         CREATE TABLE IF NOT EXISTS persons_cache (
           id BIGINT PRIMARY KEY,
@@ -103,30 +102,7 @@ async def init_db():
         );
         """)
 
-        # 2) Schema-Migration für bestehende DBs (WICHTIG!)
-        # persons_cache
-        await conn.execute("ALTER TABLE persons_cache ADD COLUMN IF NOT EXISTS first_name TEXT;")
-        await conn.execute("ALTER TABLE persons_cache ADD COLUMN IF NOT EXISTS last_name TEXT;")
-        await conn.execute("ALTER TABLE persons_cache ADD COLUMN IF NOT EXISTS gender TEXT;")
-        await conn.execute("ALTER TABLE persons_cache ADD COLUMN IF NOT EXISTS email TEXT;")
-        await conn.execute("ALTER TABLE persons_cache ADD COLUMN IF NOT EXISTS du_sie TEXT;")
-        await conn.execute("ALTER TABLE persons_cache ADD COLUMN IF NOT EXISTS position TEXT;")
-        await conn.execute("ALTER TABLE persons_cache ADD COLUMN IF NOT EXISTS linkedin_url TEXT;")
-        await conn.execute("ALTER TABLE persons_cache ADD COLUMN IF NOT EXISTS org_id BIGINT;")
-        await conn.execute("ALTER TABLE persons_cache ADD COLUMN IF NOT EXISTS update_time TIMESTAMPTZ;")
-        await conn.execute("ALTER TABLE persons_cache ADD COLUMN IF NOT EXISTS label_ids BIGINT[];")
-
-        # orgs_cache
-        await conn.execute("ALTER TABLE orgs_cache ADD COLUMN IF NOT EXISTS name TEXT;")
-        await conn.execute("ALTER TABLE orgs_cache ADD COLUMN IF NOT EXISTS address TEXT;")
-        await conn.execute("ALTER TABLE orgs_cache ADD COLUMN IF NOT EXISTS website TEXT;")
-        await conn.execute("ALTER TABLE orgs_cache ADD COLUMN IF NOT EXISTS update_time TIMESTAMPTZ;")
-
-        # sync_state
-        await conn.execute("ALTER TABLE sync_state ADD COLUMN IF NOT EXISTS last_cursor TEXT;")
-        await conn.execute("ALTER TABLE sync_state ADD COLUMN IF NOT EXISTS full_in_progress BOOLEAN NOT NULL DEFAULT FALSE;")
-
-        # 3) Indizes (nach Migration safe)
+        # Personen-Indizes (schnell für DQ-Listen)
         await conn.execute("""
         CREATE INDEX IF NOT EXISTS idx_persons_missing_first_name
         ON persons_cache (id)
@@ -174,6 +150,7 @@ async def init_db():
         ON persons_cache (org_id);
         """)
 
+        # Org-Indizes
         await conn.execute("""
         CREATE INDEX IF NOT EXISTS idx_orgs_name
         ON orgs_cache (name);
@@ -209,20 +186,14 @@ async def get_sync_cursor(entity: str) -> tuple[Optional[str], bool]:
             return None, False
         return row["last_cursor"], bool(row["full_in_progress"])
 
+
 async def set_sync_cursor(entity: str, cursor: Optional[str], in_progress: bool):
-    """
-    Wichtig: sync_state Zeile kann fehlen (alte DB / noch nie get_sync_time aufgerufen).
-    Wir legen sie per UPSERT an.
-    """
     async with db_pool.acquire() as conn:
         await conn.execute("""
-            INSERT INTO sync_state(entity, last_update_time, last_cursor, full_in_progress)
-            VALUES($1, $2, $3, $4)
-            ON CONFLICT(entity) DO UPDATE SET
-              last_cursor = EXCLUDED.last_cursor,
-              full_in_progress = EXCLUDED.full_in_progress
-        """, entity, datetime(1970, 1, 1, tzinfo=timezone.utc), cursor, in_progress)
-
+            UPDATE sync_state
+            SET last_cursor=$2, full_in_progress=$3
+            WHERE entity=$1
+        """, entity, cursor, in_progress)
 
 
 @app.on_event("startup")
@@ -305,8 +276,6 @@ def extract_address(address_value):
 ########################################################################
 
 CSS_VERSION = "1"  # hochzählen, wenn du CSS änderst (Cache-Busting)
-FREELANCER_ORG_NAME = "Freelancer"
-
 
 # Kontakt-Feldkeys
 PD_PERSON_GENDER_KEY = "c4f5f434cdb0cfce3f6d62ec7291188fe968ac72"
@@ -319,8 +288,11 @@ PD_ORG_NAME_KEY = "name"
 PD_ORG_ADDRESS_KEY = "address"
 PD_ORG_WEBSITE_KEY = "website"
 
-# Allowed chars (A–Z + Umlaute + Leerzeichen + Bindestrich + Apostroph)
-NAME_ALLOWED_REGEX = re.compile(r"^[A-Za-zÄÖÜäöüß\s\-']+$")
+# Erlaubte Zeichen in Vor-/Nachname:
+# - Unicode Buchstaben (inkl. Akzente) + Combining Marks
+# - Leerzeichen (Unicode Space Separators)
+# - Bindestrich/Hyphen (inkl. häufige Varianten), Punkt, Apostroph
+NAME_ALLOWED_PUNCT = set(["-", "‐", "‑", "–", "—", ".", "'", "’"])  # hyphen variants + dot + apostroph
 
 # Titel-Erkennung im Vornamen
 TITLE_PREFIX_REGEX = re.compile(
@@ -387,64 +359,6 @@ DQ_CARDS = [
         "description": "",
         "actions": [
             {"label": "Fehlende Daten", "href": "/dq/contacts/linkedin/missing"},
-        ],
-    },
-
-    # Freelancer
-    {
-        "group": "Freelancer",
-        "title": "Vorname",
-        "description": "Organisation = Freelancer",
-        "actions": [
-            {"label": "Fehlende Daten", "href": "/dq/freelancers/first_name/missing"},
-        ],
-    },
-    {
-        "group": "Freelancer",
-        "title": "Nachname",
-        "description": "Organisation = Freelancer",
-        "actions": [
-            {"label": "Fehlende Daten", "href": "/dq/freelancers/last_name/missing"},
-        ],
-    },
-    {
-        "group": "Freelancer",
-        "title": "Geschlecht",
-        "description": "Organisation = Freelancer",
-        "actions": [
-            {"label": "Fehlende Daten", "href": "/dq/freelancers/gender/missing"},
-        ],
-    },
-    {
-        "group": "Freelancer",
-        "title": "E-Mail-Adresse",
-        "description": "Organisation = Freelancer",
-        "actions": [
-            {"label": "Fehlende Daten", "href": "/dq/freelancers/email/missing"},
-        ],
-    },
-    {
-        "group": "Freelancer",
-        "title": "Du oder Sie",
-        "description": "Organisation = Freelancer",
-        "actions": [
-            {"label": "Fehlende Daten", "href": "/dq/freelancers/du_sie/missing"},
-        ],
-    },
-    {
-        "group": "Freelancer",
-        "title": "Position",
-        "description": "Organisation = Freelancer",
-        "actions": [
-            {"label": "Fehlende Daten", "href": "/dq/freelancers/position/missing"},
-        ],
-    },
-    {
-        "group": "Freelancer",
-        "title": "LinkedIn-URL",
-        "description": "Organisation = Freelancer",
-        "actions": [
-            {"label": "Fehlende Daten", "href": "/dq/freelancers/linkedin/missing"},
         ],
     },
 
@@ -712,11 +626,112 @@ def _is_missing(v: Any) -> bool:
     return False
 
 
+def _is_valid_name_char(ch: str) -> bool:
+    # Spaces: allow Unicode space separators (but not newlines/tabs)
+    if not ch:
+        return False
+    if unicodedata.category(ch) == "Zs" or ch in (" ", "\u00A0"):
+        return True
+
+    # Allowed punctuation commonly used in names
+    if ch in NAME_ALLOWED_PUNCT:
+        return True
+
+    # Letters + combining marks (accents)
+    cat = unicodedata.category(ch)
+    if cat and cat[0] in ("L", "M"):
+        return True
+
+    return False
+
+
 def _has_invalid_name_chars(text: str) -> bool:
+    """
+    True, wenn ein Name Zeichen enthält, die wir NICHT erlauben wollen.
+
+    Erlaubt:
+    - Buchstaben (inkl. Akzente wie é, ñ, à, …)
+    - Combining marks (falls Text in NFD vorliegt)
+    - Leerzeichen
+    - Bindestrich/Hyphen (inkl. häufiger Varianten), Punkt, Apostroph (gerade/typografisch)
+
+    Nicht erlaubt:
+    - Emojis
+    - Ziffern
+    - „komische“ Symbole (z.B. @, #, /, etc.)
+    """
     t = (text or "").strip()
     if not t:
         return False
-    return NAME_ALLOWED_REGEX.match(t) is None
+
+    for ch in t:
+        if not _is_valid_name_char(ch):
+            return True
+    return False
+
+async def _db_collect_invalid_person_name_rows(
+    col: str,
+    after_id: int,
+    limit: int,
+    *,
+    scan_batch: int = 2000,
+) -> tuple[list[dict], int, bool]:
+    """
+    Filtert "invalid chars" serverseitig in Python, damit Akzente (é, ñ, …) NICHT fälschlich
+    als ungültig gelten.
+
+    Pagination:
+    - after_id ist der letzte *gescannte* ID-Wert (nicht nur der letzte Treffer).
+    - Rückgabe: (treffer_rows, next_after_id, has_more)
+    """
+    if not db_pool:
+        return [], after_id, False
+
+    col = "first_name" if col == "first_name" else ("last_name" if col == "last_name" else col)
+
+    out: list[dict] = []
+    scanned_last = int(after_id)
+
+    async with db_pool.acquire() as conn:
+        while len(out) < limit:
+            rows = await conn.fetch(
+                f"""
+                SELECT id, first_name, last_name, {col} AS name_col
+                FROM persons_cache
+                WHERE {col} IS NOT NULL
+                  AND btrim({col}) <> ''
+                  AND id > $1
+                ORDER BY id
+                LIMIT $2
+                """,
+                scanned_last,
+                scan_batch,
+            )
+
+            if not rows:
+                return out, scanned_last, False
+
+            for r in rows:
+                scanned_last = int(r["id"])
+                name_val = (r["name_col"] or "").strip()
+                if _has_invalid_name_chars(name_val):
+                    out.append(
+                        {
+                            "id": int(r["id"]),
+                            "first_name": r.get("first_name"),
+                            "last_name": r.get("last_name"),
+                        }
+                    )
+                    if len(out) >= limit:
+                        break
+
+            # Wenn wir weniger als scan_batch bekommen, sind wir am Ende der Tabelle angekommen
+            if len(rows) < scan_batch:
+                return out, scanned_last, False
+
+    # Wir haben genug Treffer gesammelt; es gibt sehr wahrscheinlich noch mehr
+    return out, scanned_last, True
+
 
 
 async def pipedrive_update_v2(entity: str, entity_id: int, payload: dict, headers: dict) -> dict:
@@ -1645,7 +1660,7 @@ async def overview(request: Request):
       <div class="topbar">
         <div>
           <div class="title">Datenqualität – Übersicht</div>
-          <div class="subtitle">Wähle eine Prüfung aus (Kontakte, Freelancer & Organisationen).</div>
+          <div class="subtitle">Wähle eine Prüfung aus (Kontakte & Organisationen).</div>
         </div>
         <div style="display:flex; gap:10px; align-items:center;">
           <a class="btn btn-outline" href="/logout">Logout</a>
@@ -1653,11 +1668,9 @@ async def overview(request: Request):
       </div>
 
       {_render_cards("Kontakte")}
-      {_render_cards("Freelancer")}
       {_render_cards("Organisationen")}
     """
     return HTMLResponse(page_shell("Datenqualität – Übersicht", body))
-
 
 
 @app.get("/logout")
@@ -1861,30 +1874,15 @@ async def dq_first_name_invalidchars_db(after_id: int = 0, limit: int = 200):
 
     limit = max(50, min(int(limit), 500))
 
-    # Postgres regex: erlaubt A-Z, Umlaute, Leerzeichen, - und '
-    pattern = r"^[A-Za-zÄÖÜäöüß\s\-']+$"
-
-    sql = """
-    SELECT id, first_name, last_name
-    FROM persons_cache
-    WHERE first_name IS NOT NULL
-      AND btrim(first_name) <> ''
-      AND first_name !~ $1
-      AND id > $2
-    ORDER BY id
-    LIMIT $3
-    """
-
-    async with db_pool.acquire() as conn:
-        rows = await conn.fetch(sql, pattern, after_id, limit)
+    rows, next_after_id, has_more = await _db_collect_invalid_person_name_rows(
+        "first_name", after_id, limit
+    )
 
     trs = []
-    last_id = after_id
     for r in rows:
         pid = int(r["id"])
-        last_id = pid
-        fn = (r["first_name"] or "").strip() or "-"
-        ln = (r["last_name"] or "").strip() or "-"
+        fn = (r.get("first_name") or "").strip() or "-"
+        ln = (r.get("last_name") or "").strip() or "-"
         trs.append(f"""
           <tr>
             <td><code class="badge">{pid}</code></td>
@@ -1895,8 +1893,8 @@ async def dq_first_name_invalidchars_db(after_id: int = 0, limit: int = 200):
         """)
 
     next_link = ""
-    if rows:
-        next_link = f'<a class="btn btn-outline" href="/dq/contacts/first_name/invalidchars?after_id={last_id}&limit={limit}">Weiter →</a>'
+    if has_more:
+        next_link = f'<a class="btn btn-outline" href="/dq/contacts/first_name/invalidchars?after_id={next_after_id}&limit={limit}">Weiter →</a>'
 
     body = f"""
       <div class="topbar">
@@ -1929,59 +1927,6 @@ async def dq_first_name_invalidchars_db(after_id: int = 0, limit: int = 200):
     return HTMLResponse(page_shell("Vorname – Ungültige Zeichen", body))
 
 
-
-_PERSON_FIELDS_OPTIONS_BY_KEY: Optional[dict[str, list[tuple[str, str]]]] = None
-
-
-async def _load_person_fields_options_v1(headers: dict) -> dict[str, list[tuple[str, str]]]:
-    """
-    Lädt ALLE Person-Felder (v1) und mappt options nach field 'key'.
-    Hintergrund: In einigen Accounts liefert /api/v2/personFields/{...} mit dem Hash-Key 404.
-    v1 liefert zuverlässig 'key' + 'options' und ist für Dropdowns ausreichend.
-    """
-    global _PERSON_FIELDS_OPTIONS_BY_KEY
-    if _PERSON_FIELDS_OPTIONS_BY_KEY is not None:
-        return _PERSON_FIELDS_OPTIONS_BY_KEY
-
-    url = "https://api.pipedrive.com/v1/personFields"
-    async with httpx.AsyncClient(timeout=30.0) as client:
-        r = await client.get(url, headers=headers)
-
-    if r.status_code != 200:
-        _PERSON_FIELDS_OPTIONS_BY_KEY = {}
-        return _PERSON_FIELDS_OPTIONS_BY_KEY
-
-    data = (r.json() or {}).get("data") or []
-    mapping: dict[str, list[tuple[str, str]]] = {}
-
-    for f in data:
-        key = f.get("key")
-        if not key:
-            continue
-        opts = f.get("options") or []
-        out: list[tuple[str, str]] = []
-        for o in opts:
-            if not isinstance(o, dict):
-                continue
-            oid = o.get("id")
-            lab = o.get("label") or o.get("name") or ""
-            if oid is None:
-                continue
-            out.append((str(oid), str(lab)))
-        mapping[str(key)] = out
-
-    _PERSON_FIELDS_OPTIONS_BY_KEY = mapping
-    return mapping
-
-
-async def get_person_field_options(headers: dict, field_key: str) -> list[tuple[str, str]]:
-    """
-    Gibt Optionen für ein Person-Custom-Field (Single Option) zurück.
-
-    field_key = Hash-Key (z.B. 'c4f5...'), wie er in Person.custom_fields auftaucht.
-    """
-    mapping = await _load_person_fields_options_v1(headers)
-    return mapping.get(field_key, [])
 @app.get("/dq/contacts/person/{person_id}", response_class=HTMLResponse)
 async def dq_person_detail_db(person_id: int, saved: int = 0):
     if "default" not in user_tokens:
@@ -2167,28 +2112,16 @@ async def dq_last_name_invalidchars_db(after_id: int = 0, limit: int = 200):
         return HTMLResponse("DB nicht initialisiert", status_code=500)
 
     limit = max(50, min(int(limit), 500))
-    pattern = r"^[A-Za-zÄÖÜäöüß\s\-']+$"
 
-    sql = """
-    SELECT id, first_name, last_name
-    FROM persons_cache
-    WHERE last_name IS NOT NULL
-      AND btrim(last_name) <> ''
-      AND last_name !~ $1
-      AND id > $2
-    ORDER BY id
-    LIMIT $3
-    """
-    async with db_pool.acquire() as conn:
-        rows = await conn.fetch(sql, pattern, after_id, limit)
+    rows, next_after_id, has_more = await _db_collect_invalid_person_name_rows(
+        "last_name", after_id, limit
+    )
 
     trs = []
-    last_id = after_id
     for r in rows:
         pid = int(r["id"])
-        last_id = pid
-        fn = (r["first_name"] or "").strip() or "-"
-        ln = (r["last_name"] or "").strip() or "-"
+        fn = (r.get("first_name") or "").strip() or "-"
+        ln = (r.get("last_name") or "").strip() or "-"
         trs.append(f"""
           <tr>
             <td><code class="badge">{pid}</code></td>
@@ -2199,8 +2132,8 @@ async def dq_last_name_invalidchars_db(after_id: int = 0, limit: int = 200):
         """)
 
     next_link = ""
-    if rows:
-        next_link = f'<a class="btn btn-outline" href="/dq/contacts/last_name/invalidchars?after_id={last_id}&limit={limit}">Weiter →</a>'
+    if has_more:
+        next_link = f'<a class="btn btn-outline" href="/dq/contacts/last_name/invalidchars?after_id={next_after_id}&limit={limit}">Weiter →</a>'
 
     body = f"""
       <div class="topbar">
@@ -2231,138 +2164,6 @@ async def dq_last_name_invalidchars_db(after_id: int = 0, limit: int = 200):
       </div>
     """
     return HTMLResponse(page_shell("Nachname – Ungültige Zeichen", body))
-
-def _freelancer_filter_sql(mode: str) -> str:
-    """
-    mode:
-      - "only": nur Freelancer (org.name = FREELANCER_ORG_NAME)
-      - "exclude": alles außer Freelancer
-      - "all": keine Filterung
-    """
-    if mode == "all":
-        return ""
-
-    # persons_cache.org_id -> orgs_cache.id
-    # Achtung: org_id kann NULL sein; bei exclude wollen wir die behalten.
-    if mode == "only":
-        return """
-          AND EXISTS (
-            SELECT 1 FROM orgs_cache o
-            WHERE o.id = persons_cache.org_id
-              AND lower(o.name) = lower($3)
-          )
-        """
-    if mode == "exclude":
-        return """
-          AND NOT EXISTS (
-            SELECT 1 FROM orgs_cache o
-            WHERE o.id = persons_cache.org_id
-              AND lower(o.name) = lower($3)
-          )
-        """
-    return ""
-
-def _dq_missing_sql_for_column(col: str, freelancer_mode: str = "exclude") -> str:
-    """
-    freelancer_mode:
-      - "exclude" = Kontakte ohne Freelancer (Default)
-      - "only"    = nur Freelancer
-      - "all"     = keine Filterung
-    """
-    flt = _freelancer_filter_sql(freelancer_mode)
-
-    # Parameter:
-    # $1 = after_id, $2 = limit, $3 = FREELANCER_ORG_NAME (nur wenn flt != "")
-    if flt.strip():
-        return f"""
-        SELECT id, first_name, last_name
-        FROM persons_cache
-        WHERE ({col} IS NULL OR btrim({col}) = '')
-          AND id > $1
-        {flt}
-        ORDER BY id
-        LIMIT $2
-        """
-    else:
-        return f"""
-        SELECT id, first_name, last_name
-        FROM persons_cache
-        WHERE ({col} IS NULL OR btrim({col}) = '')
-          AND id > $1
-        ORDER BY id
-        LIMIT $2
-        """
-
-async def _render_missing_list(
-    title: str,
-    base_path: str,
-    after_id: int,
-    limit: int,
-    sql: str,
-    freelancer_mode: str = "exclude",
-) -> HTMLResponse:
-    """
-    Wenn freelancer_mode != "all", erwartet das SQL ein $3 mit FREELANCER_ORG_NAME.
-    """
-    async with db_pool.acquire() as conn:
-        if freelancer_mode in ("only", "exclude"):
-            rows = await conn.fetch(sql, after_id, limit, FREELANCER_ORG_NAME)
-        else:
-            rows = await conn.fetch(sql, after_id, limit)
-
-    trs = []
-    last_id = after_id
-    for r in rows:
-        pid = int(r["id"])
-        last_id = pid
-        fn = (r["first_name"] or "").strip() or "-"
-        ln = (r["last_name"] or "").strip() or "-"
-        trs.append(f"""
-          <tr>
-            <td><code class="badge">{pid}</code></td>
-            <td>{html_escape(fn)}</td>
-            <td>{html_escape(ln)}</td>
-            <td style="width:160px;"><a class="chip" href="/dq/contacts/person/{pid}">Öffnen</a></td>
-          </tr>
-        """)
-
-    next_link = ""
-    if rows:
-        next_link = f'<a class="btn btn-outline" href="{base_path}?after_id={last_id}&limit={limit}">Weiter →</a>'
-
-    subtitle = "Kontakte (ohne Freelancer)" if freelancer_mode == "exclude" else ("Nur Freelancer" if freelancer_mode == "only" else "Alle Kontakte")
-
-    body = f"""
-      <div class="topbar">
-        <div>
-          <div class="title">{title}</div>
-          <div class="subtitle">{subtitle} · Liste aus Cache-DB · Page size: {limit}</div>
-        </div>
-        <div style="display:flex; gap:10px;">
-          <a class="btn btn-outline" href="/overview">← Zur Übersicht</a>
-          {next_link}
-        </div>
-      </div>
-
-      <div class="panel">
-        <table>
-          <thead>
-            <tr>
-              <th style="width:120px;">ID</th>
-              <th>Vorname</th>
-              <th>Nachname</th>
-              <th style="width:160px;">Aktion</th>
-            </tr>
-          </thead>
-          <tbody>
-            {''.join(trs) if trs else '<tr><td colspan="4">✅ Keine Treffer.</td></tr>'}
-          </tbody>
-        </table>
-      </div>
-    """
-    return HTMLResponse(page_shell(title, body))
-
-
 
 
 @app.get("/dq/contacts/gender/missing", response_class=HTMLResponse)
@@ -2409,90 +2210,6 @@ async def dq_linkedin_missing_db(after_id: int = 0, limit: int = 200):
         return HTMLResponse("DB nicht initialisiert", status_code=500)
     limit = max(50, min(int(limit), 500))
     return await _render_missing_list("LinkedIn-URL – Fehlende Daten", "/dq/contacts/linkedin/missing", after_id, limit, _dq_missing_sql_for_column("linkedin_url"))
-
-@app.get("/dq/freelancers/first_name/missing", response_class=HTMLResponse)
-async def dq_freelancers_first_name_missing(after_id: int = 0, limit: int = 200):
-    if "default" not in user_tokens:
-        return RedirectResponse("/login")
-    if not db_pool:
-        return HTMLResponse("DB nicht initialisiert", status_code=500)
-
-    limit = max(50, min(int(limit), 500))
-    sql = _dq_missing_sql_for_column("first_name", freelancer_mode="only")
-    return await _render_missing_list("Freelancer – Vorname (fehlend)", "/dq/freelancers/first_name/missing", after_id, limit, sql, freelancer_mode="only")
-
-
-@app.get("/dq/freelancers/last_name/missing", response_class=HTMLResponse)
-async def dq_freelancers_last_name_missing(after_id: int = 0, limit: int = 200):
-    if "default" not in user_tokens:
-        return RedirectResponse("/login")
-    if not db_pool:
-        return HTMLResponse("DB nicht initialisiert", status_code=500)
-
-    limit = max(50, min(int(limit), 500))
-    sql = _dq_missing_sql_for_column("last_name", freelancer_mode="only")
-    return await _render_missing_list("Freelancer – Nachname (fehlend)", "/dq/freelancers/last_name/missing", after_id, limit, sql, freelancer_mode="only")
-
-
-@app.get("/dq/freelancers/gender/missing", response_class=HTMLResponse)
-async def dq_freelancers_gender_missing(after_id: int = 0, limit: int = 200):
-    if "default" not in user_tokens:
-        return RedirectResponse("/login")
-    if not db_pool:
-        return HTMLResponse("DB nicht initialisiert", status_code=500)
-
-    limit = max(50, min(int(limit), 500))
-    sql = _dq_missing_sql_for_column("gender", freelancer_mode="only")
-    return await _render_missing_list("Freelancer – Geschlecht (fehlend)", "/dq/freelancers/gender/missing", after_id, limit, sql, freelancer_mode="only")
-
-
-@app.get("/dq/freelancers/email/missing", response_class=HTMLResponse)
-async def dq_freelancers_email_missing(after_id: int = 0, limit: int = 200):
-    if "default" not in user_tokens:
-        return RedirectResponse("/login")
-    if not db_pool:
-        return HTMLResponse("DB nicht initialisiert", status_code=500)
-
-    limit = max(50, min(int(limit), 500))
-    sql = _dq_missing_sql_for_column("email", freelancer_mode="only")
-    return await _render_missing_list("Freelancer – E-Mail (fehlend)", "/dq/freelancers/email/missing", after_id, limit, sql, freelancer_mode="only")
-
-
-@app.get("/dq/freelancers/du_sie/missing", response_class=HTMLResponse)
-async def dq_freelancers_du_sie_missing(after_id: int = 0, limit: int = 200):
-    if "default" not in user_tokens:
-        return RedirectResponse("/login")
-    if not db_pool:
-        return HTMLResponse("DB nicht initialisiert", status_code=500)
-
-    limit = max(50, min(int(limit), 500))
-    sql = _dq_missing_sql_for_column("du_sie", freelancer_mode="only")
-    return await _render_missing_list("Freelancer – Du/Sie (fehlend)", "/dq/freelancers/du_sie/missing", after_id, limit, sql, freelancer_mode="only")
-
-
-@app.get("/dq/freelancers/position/missing", response_class=HTMLResponse)
-async def dq_freelancers_position_missing(after_id: int = 0, limit: int = 200):
-    if "default" not in user_tokens:
-        return RedirectResponse("/login")
-    if not db_pool:
-        return HTMLResponse("DB nicht initialisiert", status_code=500)
-
-    limit = max(50, min(int(limit), 500))
-    sql = _dq_missing_sql_for_column("position", freelancer_mode="only")
-    return await _render_missing_list("Freelancer – Position (fehlend)", "/dq/freelancers/position/missing", after_id, limit, sql, freelancer_mode="only")
-
-
-@app.get("/dq/freelancers/linkedin/missing", response_class=HTMLResponse)
-async def dq_freelancers_linkedin_missing(after_id: int = 0, limit: int = 200):
-    if "default" not in user_tokens:
-        return RedirectResponse("/login")
-    if not db_pool:
-        return HTMLResponse("DB nicht initialisiert", status_code=500)
-
-    limit = max(50, min(int(limit), 500))
-    sql = _dq_missing_sql_for_column("linkedin_url", freelancer_mode="only")
-    return await _render_missing_list("Freelancer – LinkedIn (fehlend)", "/dq/freelancers/linkedin/missing", after_id, limit, sql, freelancer_mode="only")
-
 
 
 @app.get("/dq/contacts/first_name/title", response_class=HTMLResponse)
@@ -2888,29 +2605,22 @@ async def admin_page():
     """
     return HTMLResponse(page_shell("Admin – Sync", body))
 
-
 @app.get("/admin/sync")
 async def admin_sync(entity: str = "persons", full: int = 0, max_pages: int = 20):
     if "default" not in user_tokens:
         return RedirectResponse("/login")
 
     if not db_pool:
-        return JSONResponse({"ok": False, "error": "DATABASE_URL fehlt / DB nicht initialisiert"}, status_code=500)
+        return {"ok": False, "error": "DATABASE_URL fehlt / DB nicht initialisiert"}
 
-    try:
-        if entity == "persons":
-            res = await sync_persons_incremental(full=bool(full), max_pages=max_pages)
-            return {"ok": True, "result": res}
+    if entity == "persons":
+        res = await sync_persons_incremental(full=bool(full), max_pages=max_pages)
+        return {"ok": True, "result": res}
+    if entity in ("orgs", "organizations"):
+        res = await sync_orgs_incremental(full=bool(full), max_pages=max_pages)
+        return {"ok": True, "result": res}
 
-        if entity in ("orgs", "organizations"):
-            res = await sync_orgs_incremental(full=bool(full), max_pages=max_pages)
-            return {"ok": True, "result": res}
-
-        return JSONResponse({"ok": False, "error": "entity muss 'persons' oder 'organizations' sein"}, status_code=400)
-
-    except Exception as e:
-        # Das ist Gold wert beim Debuggen: z.B. "column address does not exist"
-        return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
+    return {"ok": False, "error": "entity muss 'persons' oder 'organizations' sein"}
 
 
 @app.get("/admin/sync/status")
