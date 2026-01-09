@@ -413,6 +413,78 @@ def pd_get_value_v2(entity: dict, field_key: str):
     cf = entity.get("custom_fields") or {}
     return cf.get(field_key)
 
+def normalize_update_payload_v2(entity_type: str, field_key: str, value: str) -> dict:
+    """
+    Baut ein v2-konformes PATCH-Payload-Fragment für persons & organizations.
+
+    organizations:
+      - name, website, address
+      - address wird primär als string gepatcht; fallback (object) macht dq_update()
+
+    persons:
+      - emails (list of objects)
+      - label_ids (array[int])
+      - custom_fields (single-option -> int)
+    """
+    v = (value or "").strip()
+    et = (entity_type or "").strip().lower()
+
+    # ---------------- organizations ----------------
+    if et == "organization":
+        if field_key in ("name", "website"):
+            return {field_key: (v if v else None)}
+        if field_key == "address":
+            # Viele Accounts akzeptieren address als string
+            return {"address": (v if v else None)}
+        # default
+        return {field_key: (v if v else None)}
+
+    # ---------------- persons ----------------
+    # 1) emails (v2)
+    if field_key == "emails":
+        if not v:
+            return {"emails": []}
+        return {"emails": [{"value": v, "primary": True}]}
+
+    # 2) label_ids (v2 root field)
+    if field_key == "label_ids":
+        if not v:
+            return {"label_ids": []}
+        ids: list[int] = []
+        for part in v.split(","):
+            part = part.strip()
+            if part.isdigit():
+                ids.append(int(part))
+        return {"label_ids": ids}
+
+    # 3) Custom fields (v2)
+    SINGLE_OPTION_CUSTOM_FIELDS = {
+        PD_PERSON_GENDER_KEY,
+        PD_PERSON_DU_SIE_KEY,
+    }
+
+    if field_key in SINGLE_OPTION_CUSTOM_FIELDS:
+        if not v:
+            cf_val = None
+        elif v.isdigit():
+            cf_val = int(v)
+        else:
+            cf_val = None
+        return {"custom_fields": {field_key: cf_val}}
+
+    # Text/sonstige Custom Fields (Position, Linkedin, etc.)
+    if field_key in {
+        PD_PERSON_POSITION_KEY,
+        PD_PERSON_LINKEDIN_KEY,
+        PD_PERSON_GENDER_KEY,
+        PD_PERSON_DU_SIE_KEY,
+    }:
+        return {"custom_fields": {field_key: (v if v else None)}}
+
+    # Default: Root-Feld direkt patchen
+    return {field_key: (v if v else None)}
+
+
 
 def normalize_person_update_payload_v2(field_key: str, value: str) -> dict:
     """
@@ -643,12 +715,67 @@ def _label_ids_list(p: dict) -> list[int]:
     return []
 
 
+def _get_custom_field_value(entity: dict, key: str) -> Any:
+    """Robust: v2 custom fields können in entity['custom_fields'] ODER direkt auf Root liegen."""
+    if not entity or not key:
+        return None
+    cf = entity.get("custom_fields")
+    if isinstance(cf, dict) and key in cf:
+        return cf.get(key)
+    return entity.get(key)
+
+
+def _as_option_id_str(v: Any) -> str:
+    """Für Single-Option-Felder: extrahiert möglichst die Option-ID als String."""
+    if v is None:
+        return ""
+    if isinstance(v, bool):
+        # bool ist int-subclass, wollen wir hier nicht
+        return ""
+    if isinstance(v, int):
+        return str(v)
+    if isinstance(v, str):
+        return v.strip()
+    if isinstance(v, dict):
+        # mögliche Shapes: {"id": 123}, {"value": 123}, {"value":"123"}
+        if v.get("id") is not None:
+            return str(v.get("id")).strip()
+        if v.get("value") is not None:
+            return str(v.get("value")).strip()
+    # Fallback: nicht ideal, aber besser als komplett leer
+    return str(v).strip()
+
+
+def _email_primary_from_person(p: dict) -> str:
+    """v2 liefert meist 'emails' (list[dict]); manche Accounts liefern noch 'email'."""
+    items = p.get("emails")
+    if not items:
+        items = p.get("email")
+    primary = _primary_from_list(items)
+    if primary:
+        return primary
+    # Fallback: scalarize + erstes Element
+    s = _scalarize(items).strip()
+    if not s:
+        return ""
+    return s.split(",")[0].strip()
+
+
+
 
 async def upsert_persons(batch: list[dict]) -> Optional[datetime]:
+    """
+    Speichert Persons in persons_cache.
+
+    Wichtig: Robust gegen unterschiedliche Shapes der API:
+    - emails kann 'emails' (v2) ODER 'email' (legacy) sein
+    - custom fields können in 'custom_fields' ODER direkt auf Root liegen
+    - Single-option custom fields können int ODER dict sein -> wir speichern die Option-ID als TEXT
+    """
     if not batch:
         return None
 
-    rows = []
+    rows: list[tuple] = []
     max_ts: Optional[datetime] = None
 
     for p in batch:
@@ -660,25 +787,26 @@ async def upsert_persons(batch: list[dict]) -> Optional[datetime]:
         if ts and (max_ts is None or ts > max_ts):
             max_ts = ts
 
-        custom = p.get("custom_fields") or {}
+        email_primary = _email_primary_from_person(p)
 
-        email_primary = _primary_from_list(p.get("emails"))  # v2: emails (list of objects)
+        gender_raw = _get_custom_field_value(p, PD_PERSON_GENDER_KEY)
+        dusie_raw = _get_custom_field_value(p, PD_PERSON_DU_SIE_KEY)
 
-        gender_id = custom.get(PD_PERSON_GENDER_KEY)
-        du_sie_id = custom.get(PD_PERSON_DU_SIE_KEY)
+        position_raw = _get_custom_field_value(p, PD_PERSON_POSITION_KEY)
+        linkedin_raw = _get_custom_field_value(p, PD_PERSON_LINKEDIN_KEY)
 
         rows.append((
             int(pid),
             _scalarize(p.get("first_name")).strip(),
             _scalarize(p.get("last_name")).strip(),
-            (str(gender_id) if gender_id is not None else ""),   # store option id as string
+            _as_option_id_str(gender_raw),
             email_primary,
-            (str(du_sie_id) if du_sie_id is not None else ""),   # store option id as string
-            _scalarize(custom.get(PD_PERSON_POSITION_KEY)).strip(),
-            _scalarize(custom.get(PD_PERSON_LINKEDIN_KEY)).strip(),
+            _as_option_id_str(dusie_raw),
+            _scalarize(position_raw).strip(),
+            _scalarize(linkedin_raw).strip(),
             _get_org_id_from_person(p),
             ts,
-            _label_ids_list(p),  # v2: label_ids is root field (list[int])
+            _label_ids_list(p),
         ))
 
     if not rows:
@@ -965,6 +1093,68 @@ async def pipedrive_get_person_v2(person_id: int, headers: dict) -> dict:
     data = r.json() or {}
     return data.get("data") or {}
 
+
+async def refresh_person_cache_from_api(person_id: int, headers: dict) -> None:
+    """
+    Holt eine Person direkt aus Pipedrive (v2) und schreibt sie in den Cache.
+    Das behebt 'leere Felder', wenn der Initial-Sync noch nicht alles geladen hat
+    oder wenn Custom Fields/Emails in der Listen-Response nicht enthalten waren.
+    """
+    if not db_pool:
+        return
+    try:
+        p = await pipedrive_get_person_v2(person_id, headers)
+        if p:
+            await upsert_persons([p])
+    except Exception:
+        # Detail-Page soll nicht komplett crashen, wenn Pipedrive kurz zickt
+        return
+
+
+async def pipedrive_get_org_v2(org_id: int, headers: dict) -> dict:
+    """Holt eine Organisation aus API v2."""
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        r = await client.get(f"{PIPEDRIVE_API_V2_URL}/organizations/{org_id}", headers=headers)
+    if r.status_code != 200:
+        raise RuntimeError(f"Organization GET fehlgeschlagen ({r.status_code}): {r.text}")
+    return (r.json() or {}).get("data") or {}
+
+
+async def refresh_org_cache_from_api(org_id: int, headers: dict) -> None:
+    """Holt eine Org direkt aus Pipedrive (v2) und schreibt sie in den Cache."""
+    if not db_pool:
+        return
+    try:
+        o = await pipedrive_get_org_v2(org_id, headers)
+        if o:
+            await upsert_orgs([o])
+    except Exception:
+        return
+
+
+async def db_update_org_cache(org_id: int, data: dict) -> None:
+    """Optionaler direkter Cache-Update (wird aktuell nicht zwingend genutzt)."""
+    if not db_pool:
+        return
+    sql = """
+    UPDATE orgs_cache SET
+      name=$2,
+      address=$3,
+      website=$4,
+      update_time=$5
+    WHERE id=$1
+    """
+    async with db_pool.acquire() as conn:
+        await conn.execute(
+            sql,
+            org_id,
+            (data.get("name") or "").strip(),
+            (data.get("address") or "").strip(),
+            (data.get("website") or "").strip(),
+            _utcnow(),
+        )
+
+
 _PERSON_FIELD_CACHE: dict[str, dict] = {}
 
 
@@ -1146,6 +1336,70 @@ async def dq_first_name_missing_db(after_id: int = 0, limit: int = 200):
     """
     return HTMLResponse(page_shell("Vorname – Fehlende Daten", body))
 
+async def db_upsert_org_cache_partial(
+    org_id: int,
+    name: str | None = None,
+    address: str | None = None,
+    website: str | None = None,
+):
+    """
+    Zieht den Org-Cache nach einem erfolgreichen PATCH nach.
+
+    - Legt den Datensatz an, falls er noch nicht existiert.
+    - Aktualisiert nur die übergebenen Felder (andere bleiben unverändert).
+    - update_time wird immer gesetzt.
+    """
+    if not db_pool:
+        return
+
+    # "None" bedeutet: Feld nicht anfassen
+    # "" (leerer String) bedeutet: Feld bewusst leeren
+    sets = []
+    params = [org_id]
+    idx = 2
+
+    if name is not None:
+        sets.append(f"name = ${idx}")
+        params.append(name)
+        idx += 1
+
+    if address is not None:
+        sets.append(f"address = ${idx}")
+        params.append(address)
+        idx += 1
+
+    if website is not None:
+        sets.append(f"website = ${idx}")
+        params.append(website)
+        idx += 1
+
+    # update_time immer
+    sets.append(f"update_time = ${idx}")
+    params.append(_utcnow())
+    idx += 1
+
+    # Wenn keinerlei Feld übergeben wurde, trotzdem update_time anfassen (keep-alive)
+    set_clause = ", ".join(sets)
+
+    sql = f"""
+    INSERT INTO orgs_cache (id, name, address, website, update_time)
+    VALUES ($1, COALESCE($2,''), COALESCE($3,''), COALESCE($4,''), $5)
+    ON CONFLICT (id) DO UPDATE SET
+      {set_clause}
+    """
+
+    # Für INSERT brauchen wir Werte für name/address/website auch dann,
+    # wenn wir sie nicht setzen wollen -> nehmen wir vorhandene Default "".
+    insert_name = name if name is not None else ""
+    insert_address = address if address is not None else ""
+    insert_website = website if website is not None else ""
+    insert_time = _utcnow()
+
+    async with db_pool.acquire() as conn:
+        # Erst INSERT/UPSERT Basis
+        await conn.execute(sql, org_id, insert_name, insert_address, insert_website, insert_time)
+
+        # Danach optional "nur Felder setzen" ist bereits durch set_clause in DO UPDATE abgedeckt.
 
 ########################################################################
 #
@@ -1475,6 +1729,34 @@ async def db_update_person_cache(person_id: int, data: dict):
             _utcnow()
         )
 
+async def db_upsert_org_cache_partial(
+    org_id: int,
+    *,
+    name: Optional[str] = None,
+    address: Optional[str] = None,
+    website: Optional[str] = None,
+):
+    """
+    Upsert in orgs_cache, aber nur die Felder überschreiben, die übergeben wurden.
+    Leerstring "" ist erlaubt (bedeutet "fehlend").
+    """
+    if not db_pool:
+        return
+
+    now = _utcnow()
+
+    sql = """
+    INSERT INTO orgs_cache (id, name, address, website, update_time)
+    VALUES ($1, $2, $3, $4, $5)
+    ON CONFLICT (id) DO UPDATE SET
+      name        = COALESCE(EXCLUDED.name, orgs_cache.name),
+      address     = COALESCE(EXCLUDED.address, orgs_cache.address),
+      website     = COALESCE(EXCLUDED.website, orgs_cache.website),
+      update_time = EXCLUDED.update_time
+    """
+
+    async with db_pool.acquire() as conn:
+        await conn.execute(sql, org_id, name, address, website, now)
 
 
 
@@ -1556,39 +1838,58 @@ async def dq_first_name_invalidchars_db(after_id: int = 0, limit: int = 200):
 
 
 
-_field_options_cache: dict[str, list[tuple[str, str]]] = {}
+_PERSON_FIELDS_OPTIONS_BY_KEY: Optional[dict[str, list[tuple[str, str]]]] = None
 
-_field_options_cache_v2: dict[str, list[tuple[str, str]]] = {}
+
+async def _load_person_fields_options_v1(headers: dict) -> dict[str, list[tuple[str, str]]]:
+    """
+    Lädt ALLE Person-Felder (v1) und mappt options nach field 'key'.
+    Hintergrund: In einigen Accounts liefert /api/v2/personFields/{...} mit dem Hash-Key 404.
+    v1 liefert zuverlässig 'key' + 'options' und ist für Dropdowns ausreichend.
+    """
+    global _PERSON_FIELDS_OPTIONS_BY_KEY
+    if _PERSON_FIELDS_OPTIONS_BY_KEY is not None:
+        return _PERSON_FIELDS_OPTIONS_BY_KEY
+
+    url = "https://api.pipedrive.com/v1/personFields"
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        r = await client.get(url, headers=headers)
+
+    if r.status_code != 200:
+        _PERSON_FIELDS_OPTIONS_BY_KEY = {}
+        return _PERSON_FIELDS_OPTIONS_BY_KEY
+
+    data = (r.json() or {}).get("data") or []
+    mapping: dict[str, list[tuple[str, str]]] = {}
+
+    for f in data:
+        key = f.get("key")
+        if not key:
+            continue
+        opts = f.get("options") or []
+        out: list[tuple[str, str]] = []
+        for o in opts:
+            if not isinstance(o, dict):
+                continue
+            oid = o.get("id")
+            lab = o.get("label") or o.get("name") or ""
+            if oid is None:
+                continue
+            out.append((str(oid), str(lab)))
+        mapping[str(key)] = out
+
+    _PERSON_FIELDS_OPTIONS_BY_KEY = mapping
+    return mapping
+
 
 async def get_person_field_options(headers: dict, field_key: str) -> list[tuple[str, str]]:
     """
-    v2: GET /api/v2/personFields/{field_code} -> data.options[]
-    Wir cachen lokal im Prozess.
+    Gibt Optionen für ein Person-Custom-Field (Single Option) zurück.
+
+    field_key = Hash-Key (z.B. 'c4f5...'), wie er in Person.custom_fields auftaucht.
     """
-    if field_key in _field_options_cache_v2:
-        return _field_options_cache_v2[field_key]
-
-    async with httpx.AsyncClient(timeout=30.0) as client:
-        r = await client.get(f"{PIPEDRIVE_API_V2_URL}/personFields/{field_key}", headers=headers)
-
-    if r.status_code != 200:
-        _field_options_cache_v2[field_key] = []
-        return []
-
-    data = (r.json() or {}).get("data") or {}
-    options = data.get("options") or []
-
-    out: list[tuple[str, str]] = []
-    for o in options:
-        oid = o.get("id")
-        label = o.get("label") or o.get("name") or ""
-        if oid is not None:
-            out.append((str(oid), str(label)))
-
-    _field_options_cache_v2[field_key] = out
-    return out
-
-
+    mapping = await _load_person_fields_options_v1(headers)
+    return mapping.get(field_key, [])
 @app.get("/dq/contacts/person/{person_id}", response_class=HTMLResponse)
 async def dq_person_detail_db(person_id: int, saved: int = 0):
     if "default" not in user_tokens:
@@ -1596,11 +1897,15 @@ async def dq_person_detail_db(person_id: int, saved: int = 0):
     if not db_pool:
         return HTMLResponse("DB nicht initialisiert (DATABASE_URL fehlt)", status_code=500)
 
+    headers = get_headers()
+
+    # ✅ Cache IMMER einmal nachziehen, damit Detail-Ansicht wirklich Pipedrive-Stand zeigt
+    await refresh_person_cache_from_api(person_id, headers)
+
     p = await db_fetch_person_detail(person_id)
     if not p:
         return HTMLResponse("Kontakt nicht im Cache gefunden. Bitte Sync laufen lassen.", status_code=404)
 
-    headers = get_headers()
     gender_opts = await get_person_field_options(headers, PD_PERSON_GENDER_KEY)
     du_opts = await get_person_field_options(headers, PD_PERSON_DU_SIE_KEY)
 
@@ -2053,23 +2358,14 @@ async def dq_person_update_db(person_id: int, payload: dict = Body(...)):
         },
     }
 
-    # Optional: None Felder rauswerfen (sauberer PATCH)
+    # None Felder rauswerfen (sauberer PATCH)
     patch["custom_fields"] = {k: v for k, v in patch["custom_fields"].items() if v is not None}
 
     try:
         await pipedrive_patch_v2("persons", person_id, patch, headers)
 
-        # Cache nachziehen (DB)
-        if db_pool:
-            await db_update_person_cache(person_id, {
-                "first_name": first_name,
-                "last_name": last_name,
-                "gender": (gender_id if gender_id else ""),
-                "email": email,
-                "du_sie": (du_sie_id if du_sie_id else ""),
-                "position": position,
-                "linkedin_url": linkedin,
-            })
+        # ✅ Danach IMMER aus API nachziehen -> DB hat garantiert den echten Stand
+        await refresh_person_cache_from_api(person_id, headers)
 
         return JSONResponse({"ok": True})
     except Exception as e:
@@ -2247,6 +2543,15 @@ async def dq_orgs_invalidchars(field: str, after_id: int = 0, limit: int = 200):
 ########################################################################
 @app.post("/dq/update")
 async def dq_update(payload: dict = Body(...)):
+    """
+    Body:
+    {
+      "entity_type": "person" | "organization",
+      "entity_id": 123,
+      "field_key": "...",
+      "value": "..."
+    }
+    """
     if "default" not in user_tokens:
         return JSONResponse({"ok": False, "error": "Nicht eingeloggt"}, status_code=401)
 
@@ -2256,34 +2561,50 @@ async def dq_update(payload: dict = Body(...)):
     value = payload.get("value")
 
     if entity_type not in ("person", "organization"):
-        return {"ok": False, "error": "entity_type muss 'person' oder 'organization' sein"}
+        return JSONResponse({"ok": False, "error": "entity_type muss 'person' oder 'organization' sein"}, status_code=400)
     if not isinstance(entity_id, int):
-        return {"ok": False, "error": "entity_id muss int sein"}
+        return JSONResponse({"ok": False, "error": "entity_id muss int sein"}, status_code=400)
     if not field_key or not isinstance(field_key, str):
-        return {"ok": False, "error": "field_key fehlt"}
+        return JSONResponse({"ok": False, "error": "field_key fehlt"}, status_code=400)
 
     headers = get_headers()
     if not headers:
         return JSONResponse({"ok": False, "error": "Nicht eingeloggt"}, status_code=401)
 
     entity_endpoint = "persons" if entity_type == "person" else "organizations"
+    patch_fragment = normalize_update_payload_v2(entity_type, field_key, value)
 
-    # ✅ Patch-Payload korrekt je Entity bauen
-    if entity_type == "person":
-        patch_fragment = normalize_person_update_payload_v2(field_key, value)
-    else:
-        # organizations: nur Root-Felder zulassen
-        if field_key not in ("name", "address", "website"):
-            return {"ok": False, "error": "organization erlaubt nur: name, address, website"}
-
-        v = (value or "").strip()
-        patch_fragment = {field_key: (v if v else None)}
-
+    # 1) Patch versuchen
     try:
         result = await pipedrive_patch_v2(entity_endpoint, entity_id, patch_fragment, headers)
-        return {"ok": True, "result": result.get("data") or result}
+
     except Exception as e:
-        return {"ok": False, "error": str(e)}
+        # 2) Fallback nur für org.address:
+        # Manche Accounts erwarten address als Objekt {"value": "..."} statt string.
+        if entity_type == "organization" and field_key == "address":
+            v = (value or "").strip()
+            alt_payload = {"address": ({"value": v} if v else None)}
+            try:
+                result = await pipedrive_patch_v2(entity_endpoint, entity_id, alt_payload, headers)
+            except Exception:
+                return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
+        else:
+            return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
+
+    # 3) DB-Cache nachziehen (nur organizations)
+    if db_pool and entity_type == "organization":
+        v = (value or "").strip()
+        if field_key == "name":
+            await db_upsert_org_cache_partial(entity_id, name=v)
+        elif field_key == "address":
+            await db_upsert_org_cache_partial(entity_id, address=v)
+        elif field_key == "website":
+            await db_upsert_org_cache_partial(entity_id, website=v)
+        else:
+            # unknown field -> zumindest update_time anfassen
+            await db_upsert_org_cache_partial(entity_id)
+
+    return JSONResponse({"ok": True, "result": result.get("data") or result})
 
 ########################################################################
 #
