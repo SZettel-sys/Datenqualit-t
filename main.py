@@ -319,6 +319,157 @@ NAME_ALLOWED_PUNCT = set([
 ])
 
 
+
+# Postgres allowed-name regex (used for fast COUNT queries on /overview)
+# Hinweis: Die Detail-Listen (invalidchars) nutzen weiterhin die Python-Unicode-Validierung,
+# weil Postgres-RegEx/Collation je nach Setup leicht abweichen kann.
+PG_NAME_ALLOWED_PATTERN = r"^[[:alpha:][:space:]\.\'’‘´`ʼ\-‐‑‒–—−]+$"
+
+
+def _freelancer_filter_sql_alias(mode: str, alias: str, param_no: int) -> str:
+    """
+    SQL-Fragment für Freelancer-Filterung über orgs_cache.
+    param_no ist die $-Parameter-Nummer für FREELANCER_ORG_NAME.
+    """
+    if mode == "all":
+        return ""
+    if mode == "only":
+        return f"""
+          AND EXISTS (
+            SELECT 1 FROM orgs_cache o
+            WHERE o.id = {alias}.org_id
+              AND lower(o.name) = lower(${param_no})
+          )
+        """
+    if mode == "exclude":
+        return f"""
+          AND NOT EXISTS (
+            SELECT 1 FROM orgs_cache o
+            WHERE o.id = {alias}.org_id
+              AND lower(o.name) = lower(${param_no})
+          )
+        """
+    return ""
+
+
+async def _db_count(sql: str, *params) -> Optional[int]:
+    if not db_pool:
+        return None
+    async with db_pool.acquire() as conn:
+        v = await conn.fetchval(sql, *params)
+    try:
+        return int(v)
+    except Exception:
+        return None
+
+
+async def db_count_persons_missing(col: str, freelancer_mode: str = "exclude") -> Optional[int]:
+    # col ist trusted (wir rufen das nur intern mit festen Spalten auf)
+    base = f"""
+      SELECT COUNT(*) FROM persons_cache p
+      WHERE ({col} IS NULL OR btrim({col}) = '')
+    """
+    params: list[Any] = []
+    flt = _freelancer_filter_sql_alias(freelancer_mode, "p", 1)
+    if flt.strip():
+        params.append(FREELANCER_ORG_NAME)
+    sql = base + flt
+    return await _db_count(sql, *params)
+
+
+async def db_count_persons_invalid(col: str, freelancer_mode: str = "exclude") -> Optional[int]:
+    # Schnellzählung per Postgres-RegEx (für Overview). Detail-Listen filtern Python-seitig.
+    params: list[Any] = [PG_NAME_ALLOWED_PATTERN]
+    flt = _freelancer_filter_sql_alias(freelancer_mode, "p", 2)
+    if flt.strip():
+        params.append(FREELANCER_ORG_NAME)
+
+    sql = f"""
+      SELECT COUNT(*) FROM persons_cache p
+      WHERE {col} IS NOT NULL
+        AND btrim({col}) <> ''
+        AND {col} !~ $1
+      {flt}
+    """
+    return await _db_count(sql, *params)
+
+
+async def db_count_persons_title_in_firstname(freelancer_mode: str = "exclude") -> Optional[int]:
+    # Titel am Anfang (dr, prof, herr, frau ...)
+    pattern = r"^\s*(dr\.?|prof\.?|mr\.?|mrs\.?|ms\.?|herr|frau)(\s|\.|$)"
+    params: list[Any] = [pattern]
+    flt = _freelancer_filter_sql_alias(freelancer_mode, "p", 2)
+    if flt.strip():
+        params.append(FREELANCER_ORG_NAME)
+
+    sql = f"""
+      SELECT COUNT(*) FROM persons_cache p
+      WHERE p.first_name IS NOT NULL
+        AND btrim(p.first_name) <> ''
+        AND p.first_name ~* $1
+      {flt}
+    """
+    return await _db_count(sql, *params)
+
+
+async def db_count_orgs_missing(field: str) -> Optional[int]:
+    if field not in ("name", "address", "website"):
+        return None
+    sql = f"""
+      SELECT COUNT(*) FROM orgs_cache
+      WHERE ({field} IS NULL OR btrim({field}) = '')
+    """
+    return await _db_count(sql)
+
+
+async def db_count_orgs_invalid_name() -> Optional[int]:
+    # Organisationsnamen: etwas großzügiger (zusätzlich &, /, (), +, ,)
+    pattern = r"^[[:alnum:][:space:]\.\,\&\+\/\-\(\)\'’‘´`ʼ]+$"
+    sql = """
+      SELECT COUNT(*) FROM orgs_cache
+      WHERE name IS NOT NULL
+        AND btrim(name) <> ''
+        AND name !~ $1
+    """
+    return await _db_count(sql, pattern)
+
+
+async def compute_overview_counts() -> dict[str, Optional[int]]:
+    """
+    Liefert eine Map: href -> count (oder None, falls DB nicht verfügbar).
+    """
+    counts: dict[str, Optional[int]] = {}
+
+    # Kontakte (ohne Freelancer)
+    counts["/dq/contacts/first_name/missing"] = await db_count_persons_missing("first_name", "exclude")
+    counts["/dq/contacts/first_name/invalidchars"] = await db_count_persons_invalid("first_name", "exclude")
+    counts["/dq/contacts/first_name/title"] = await db_count_persons_title_in_firstname("exclude")
+
+    counts["/dq/contacts/last_name/missing"] = await db_count_persons_missing("last_name", "exclude")
+    counts["/dq/contacts/last_name/invalidchars"] = await db_count_persons_invalid("last_name", "exclude")
+
+    counts["/dq/contacts/gender/missing"] = await db_count_persons_missing("gender", "exclude")
+    counts["/dq/contacts/email/missing"] = await db_count_persons_missing("email", "exclude")
+    counts["/dq/contacts/du_sie/missing"] = await db_count_persons_missing("du_sie", "exclude")
+    counts["/dq/contacts/position/missing"] = await db_count_persons_missing("position", "exclude")
+    counts["/dq/contacts/linkedin/missing"] = await db_count_persons_missing("linkedin_url", "exclude")
+
+    # Freelancer (nur Organisation = Freelancer)
+    counts["/dq/freelancers/first_name/missing"] = await db_count_persons_missing("first_name", "only")
+    counts["/dq/freelancers/last_name/missing"] = await db_count_persons_missing("last_name", "only")
+    counts["/dq/freelancers/gender/missing"] = await db_count_persons_missing("gender", "only")
+    counts["/dq/freelancers/email/missing"] = await db_count_persons_missing("email", "only")
+    counts["/dq/freelancers/du_sie/missing"] = await db_count_persons_missing("du_sie", "only")
+    counts["/dq/freelancers/position/missing"] = await db_count_persons_missing("position", "only")
+    counts["/dq/freelancers/linkedin/missing"] = await db_count_persons_missing("linkedin_url", "only")
+
+    # Organisationen
+    counts["/dq/orgs/missing?field=name"] = await db_count_orgs_missing("name")
+    counts["/dq/orgs/missing?field=address"] = await db_count_orgs_missing("address")
+    counts["/dq/orgs/missing?field=website"] = await db_count_orgs_missing("website")
+    counts["/dq/orgs/invalidchars?field=name"] = await db_count_orgs_invalid_name()
+
+    return counts
 def _normalize_name(s: str) -> str:
     # NFKC räumt z.B. Fullwidth-Varianten auf; trim.
     return unicodedata.normalize("NFKC", (s or "")).strip()
@@ -1019,27 +1170,50 @@ DQ_CARDS = [
 ]
 
 
-def _render_cards(group: str) -> str:
+
+def _render_cards(group: str, counts: dict[str, Optional[int]]) -> str:
     cards = [c for c in DQ_CARDS if c["group"] == group]
-    group_class = "contacts" if group in ("Kontakte", "Freelancer") else "orgs"
+
     if group == "Kontakte":
+        group_class = "contacts"
         group_sub = "Personenbezogene Prüfungen (ohne Freelancer)"
     elif group == "Freelancer":
-        group_sub = "Personenbezogene Prüfungen (Organisation = Freelancer)"
+        group_class = "contacts"
+        group_sub = f"Personenbezogene Prüfungen (Organisation = {FREELANCER_ORG_NAME})"
     else:
+        group_class = "orgs"
         group_sub = "Firmendaten / Stammdaten"
+
+    def _count_badge(n: Optional[int]) -> str:
+        if n is None:
+            return ""
+        return f'<span style="margin-left:8px; padding:2px 8px; border-radius:999px; font-size:12px; background:rgba(2,132,199,.12); color:#075985;">{int(n)}</span>'
 
     card_html = []
     for c in cards:
         actions_html = []
+        total = 0
+        has_any = False
+
         for a in c.get("actions", []):
-            actions_html.append(f'<a class="chip" href="{a["href"]}">{a["label"]}</a>')
+            href = a["href"]
+            n = counts.get(href)
+            if isinstance(n, int):
+                total += n
+                has_any = True
+
+            actions_html.append(
+                f'<a class="chip" href="{href}">{a["label"]}{_count_badge(n)}</a>'
+            )
+
+        total_badge = _count_badge(total) if has_any else ""
+        desc = c.get("description", "")
 
         card_html.append(f"""
           <div class="card">
             <div class="card-top">
-              <h3>{html_escape(c["title"])}</h3>
-              <div class="card-desc">{html_escape(c.get("description",""))}</div>
+              <h3>{c["title"]}{total_badge}</h3>
+              <div class="card-desc">{desc}</div>
             </div>
             <div class="actions-row">
               {''.join(actions_html)}
@@ -1049,29 +1223,51 @@ def _render_cards(group: str) -> str:
 
     return f"""
       <div class="section-header {group_class}">
-        <div class="section-title">{html_escape(group)}</div>
-        <div class="section-sub">{html_escape(group_sub)}</div>
+        <div class="section-title">{group}</div>
+        <div class="section-sub">{group_sub}</div>
       </div>
       <div class="grid">
         {''.join(card_html)}
       </div>
     """
 
-########################################################################
-#
-# OVERVIEW
-#
-########################################################################
 @app.get("/overview", response_class=HTMLResponse)
 async def overview(request: Request):
     if "default" not in user_tokens:
         return RedirectResponse("/login")
 
+    counts = await compute_overview_counts() if db_pool else {}
+
+    def _group_total(group_name: str) -> Optional[int]:
+        total = 0
+        seen_any = False
+        for c in DQ_CARDS:
+            if c.get("group") != group_name:
+                continue
+            for a in c.get("actions", []):
+                n = counts.get(a.get("href"))
+                if isinstance(n, int):
+                    total += n
+                    seen_any = True
+        return total if seen_any else None
+
+    def _tot_badge(n: Optional[int]) -> str:
+        if n is None:
+            return ""
+        return f'<span style="margin-left:10px; padding:4px 10px; border-radius:999px; font-size:12px; background:rgba(15,23,42,.08); color:#0f172a;">Summe: <b>{int(n)}</b></span>'
+
+    total_contacts = _group_total("Kontakte")
+    total_freelancers = _group_total("Freelancer")
+    total_orgs = _group_total("Organisationen")
+
     body = f"""
       <div class="topbar">
         <div>
           <div class="title">Datenqualität – Übersicht</div>
-          <div class="subtitle">Wähle eine Prüfung aus (Kontakte, Freelancer & Organisationen).</div>
+          <div class="subtitle">
+            Kontakte = Personen <b>ohne</b> Organisation „{html_escape(FREELANCER_ORG_NAME)}“ ·
+            Freelancer = Personen mit Organisation „{html_escape(FREELANCER_ORG_NAME)}“
+          </div>
         </div>
         <div style="display:flex; gap:10px; align-items:center;">
           <a class="btn btn-outline" href="/admin">Admin</a>
@@ -1079,9 +1275,18 @@ async def overview(request: Request):
         </div>
       </div>
 
-      {_render_cards("Kontakte")}
-      {_render_cards("Freelancer")}
-      {_render_cards("Organisationen")}
+      <div class="panel" style="margin-bottom:14px;">
+        <div class="small" style="display:flex; flex-wrap:wrap; gap:12px; align-items:center;">
+          <div><b>Gesamt:</b></div>
+          <div>Kontakte{_tot_badge(total_contacts)}</div>
+          <div>Freelancer{_tot_badge(total_freelancers)}</div>
+          <div>Organisationen{_tot_badge(total_orgs)}</div>
+        </div>
+      </div>
+
+      {_render_cards("Kontakte", counts)}
+      {_render_cards("Freelancer", counts)}
+      {_render_cards("Organisationen", counts)}
     """
     return HTMLResponse(page_shell("Datenqualität – Übersicht", body))
 
