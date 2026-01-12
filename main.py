@@ -1,14 +1,16 @@
 import os
 import re
 import json
+import csv
+import io
 import httpx
 import asyncio
 import asyncpg
 import unicodedata
 from typing import Any, Optional
 
-from fastapi import FastAPI, Request, Body
-from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse
+from fastapi import FastAPI, Request, Body, UploadFile, File, Query
+from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from datetime import datetime, timezone, timedelta
 
@@ -325,6 +327,290 @@ NAME_ALLOWED_PUNCT = set([
 # weil Postgres-RegEx/Collation je nach Setup leicht abweichen kann.
 PG_NAME_ALLOWED_PATTERN = r"^[[:alpha:][:space:]\.\'’‘´`ʼ\-‐‑‒–—−]+$"
 
+
+
+
+def _csv_text(data: str, filename: str) -> Response:
+    """Helfer: liefert CSV als Download."""
+    return Response(
+        content=data,
+        media_type="text/csv; charset=utf-8",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+def _parse_ids_param(ids: str) -> list[int]:
+    out: list[int] = []
+    for part in (ids or "").split(","):
+        part = part.strip()
+        if part.isdigit():
+            out.append(int(part))
+    # dedupe, keep order
+    seen: set[int] = set()
+    uniq: list[int] = []
+    for x in out:
+        if x not in seen:
+            seen.add(x)
+            uniq.append(x)
+    return uniq
+
+
+async def db_fetch_persons_bulk(ids: list[int]) -> dict[int, dict]:
+    """Liefert Personen-Datensätze aus dem Cache als Mapping {id: row_dict}."""
+    if not ids:
+        return {}
+    sql = """
+    SELECT
+      p.id, p.first_name, p.last_name, p.gender, p.email, p.du_sie, p.position, p.linkedin_url,
+      p.org_id,
+      COALESCE(o.name, '') AS org_name
+    FROM persons_cache p
+    LEFT JOIN orgs_cache o ON o.id = p.org_id
+    WHERE p.id = ANY($1::BIGINT[])
+    """
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch(sql, ids)
+    return {int(r["id"]): dict(r) for r in rows}
+
+
+async def db_fetch_orgs_bulk(ids: list[int]) -> dict[int, dict]:
+    if not ids:
+        return {}
+    sql = """
+    SELECT id, name, address, website
+    FROM orgs_cache
+    WHERE id = ANY($1::BIGINT[])
+    """
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch(sql, ids)
+    return {int(r["id"]): dict(r) for r in rows}
+
+
+@app.get("/dq/bulk/csv")
+async def dq_bulk_csv_export(entity: str = Query(...), ids: str = Query(...)):
+    """
+    CSV-Export für ausgewählte Datensätze.
+
+    entity:
+      - person
+      - organization
+    ids: comma separated
+    """
+    if "default" not in user_tokens:
+        return RedirectResponse("/login")
+    if not db_pool:
+        return JSONResponse({"ok": False, "error": "DB nicht initialisiert"}, status_code=500)
+
+    entity = (entity or "").strip().lower()
+    id_list = _parse_ids_param(ids)
+    if entity not in ("person", "organization"):
+        return JSONResponse({"ok": False, "error": "entity muss 'person' oder 'organization' sein"}, status_code=400)
+    if not id_list:
+        return JSONResponse({"ok": False, "error": "ids leer"}, status_code=400)
+
+    sio = io.StringIO()
+    writer = csv.writer(sio, delimiter=";")
+
+    if entity == "person":
+        rows_by_id = await db_fetch_persons_bulk(id_list)
+        writer.writerow(["id", "first_name", "last_name", "email", "gender_id", "du_sie_id", "position", "linkedin_url", "org_name"])
+        for pid in id_list:
+            r = rows_by_id.get(pid) or {}
+            writer.writerow([
+                pid,
+                (r.get("first_name") or ""),
+                (r.get("last_name") or ""),
+                (r.get("email") or ""),
+                (r.get("gender") or ""),
+                (r.get("du_sie") or ""),
+                (r.get("position") or ""),
+                (r.get("linkedin_url") or ""),
+                (r.get("org_name") or ""),
+            ])
+        return _csv_text(sio.getvalue(), f"bulk_persons_{len(id_list)}.csv")
+
+    rows_by_id = await db_fetch_orgs_bulk(id_list)
+    writer.writerow(["id", "name", "address", "website"])
+    for oid in id_list:
+        r = rows_by_id.get(oid) or {}
+        writer.writerow([
+            oid,
+            (r.get("name") or ""),
+            (r.get("address") or ""),
+            (r.get("website") or ""),
+        ])
+    return _csv_text(sio.getvalue(), f"bulk_orgs_{len(id_list)}.csv")
+
+
+def _cell_value(raw: Any) -> tuple[bool, Optional[str]]:
+    """
+    CSV Import Semantik:
+    - leere Zelle => (False, None) = "nicht anfassen"
+    - '__CLEAR__' => (True, None)  = "Feld leeren"
+    - sonst => (True, value)
+    """
+    if raw is None:
+        return False, None
+    s = str(raw).strip()
+    if s == "":
+        return False, None
+    if s.upper() == "__CLEAR__":
+        return True, None
+    return True, s
+
+
+def _sniff_delimiter(sample: str) -> str:
+    for delim in [";", ",", "\t"]:
+        if sample.count(delim) >= 2:
+            return delim
+    return ";"
+
+
+@app.post("/dq/bulk/csv/import")
+async def dq_bulk_csv_import(entity: str = Query(...), file: UploadFile = File(...)):
+    """
+    CSV-Import: patcht Datensätze in Pipedrive und zieht Cache nach.
+
+    WICHTIG:
+    - Leere Zellen bedeuten: Feld NICHT ändern.
+    - '__CLEAR__' bedeutet: Feld in Pipedrive löschen/leeren.
+    """
+    if "default" not in user_tokens:
+        return JSONResponse({"ok": False, "error": "Nicht eingeloggt"}, status_code=401)
+    if not db_pool:
+        return JSONResponse({"ok": False, "error": "DB nicht initialisiert"}, status_code=500)
+
+    entity = (entity or "").strip().lower()
+    if entity not in ("person", "organization"):
+        return JSONResponse({"ok": False, "error": "entity muss 'person' oder 'organization' sein"}, status_code=400)
+
+    headers = get_headers()
+    if not headers:
+        return JSONResponse({"ok": False, "error": "Nicht eingeloggt"}, status_code=401)
+
+    raw = await file.read()
+    text_data: Optional[str] = None
+    for enc in ("utf-8-sig", "utf-8", "latin-1"):
+        try:
+            text_data = raw.decode(enc)
+            break
+        except Exception:
+            continue
+    if text_data is None:
+        return JSONResponse({"ok": False, "error": "CSV konnte nicht dekodiert werden"}, status_code=400)
+
+    sample = text_data[:4096]
+    delim = _sniff_delimiter(sample)
+    rdr = csv.DictReader(io.StringIO(text_data), delimiter=delim)
+
+    sem = asyncio.Semaphore(5)
+
+    results: dict[str, Any] = {"updated": 0, "skipped": 0, "failed": 0, "errors": []}
+
+    async def handle_row(row: dict):
+        try:
+            if not row:
+                return
+
+            rid_raw = str(row.get("id") or "").strip()
+            if not rid_raw.isdigit():
+                results["skipped"] += 1
+                return
+            rid = int(rid_raw)
+
+            if entity == "person":
+                patch: dict[str, Any] = {}
+                cf: dict[str, Any] = {}
+
+                do, v = _cell_value(row.get("first_name"))
+                if do:
+                    patch["first_name"] = v
+
+                do, v = _cell_value(row.get("last_name"))
+                if do:
+                    patch["last_name"] = v
+
+                do, v = _cell_value(row.get("email"))
+                if do:
+                    patch["emails"] = ([{"label": "work", "value": v, "primary": True}] if v else [])
+
+                do, v = _cell_value(row.get("gender_id"))
+                if do:
+                    cf[PD_PERSON_GENDER_KEY] = (int(v) if (v and str(v).isdigit()) else None)
+
+                do, v = _cell_value(row.get("du_sie_id"))
+                if do:
+                    cf[PD_PERSON_DU_SIE_KEY] = (int(v) if (v and str(v).isdigit()) else None)
+
+                do, v = _cell_value(row.get("position"))
+                if do:
+                    cf[PD_PERSON_POSITION_KEY] = v
+
+                do, v = _cell_value(row.get("linkedin_url"))
+                if do:
+                    cf[PD_PERSON_LINKEDIN_KEY] = v
+
+                if cf:
+                    patch["custom_fields"] = cf
+
+                if not patch:
+                    results["skipped"] += 1
+                    return
+
+                async with sem:
+                    await pipedrive_patch_v2("persons", rid, patch, headers)
+
+                await db_upsert_person_cache_partial(
+                    rid,
+                    first_name=patch.get("first_name") if "first_name" in patch else None,
+                    last_name=patch.get("last_name") if "last_name" in patch else None,
+                    email=(patch.get("emails")[0].get("value") if patch.get("emails") else "") if "emails" in patch else None,
+                    gender=(str(cf.get(PD_PERSON_GENDER_KEY)) if (PD_PERSON_GENDER_KEY in cf and cf.get(PD_PERSON_GENDER_KEY) is not None) else ("") if (PD_PERSON_GENDER_KEY in cf) else None),
+                    du_sie=(str(cf.get(PD_PERSON_DU_SIE_KEY)) if (PD_PERSON_DU_SIE_KEY in cf and cf.get(PD_PERSON_DU_SIE_KEY) is not None) else ("") if (PD_PERSON_DU_SIE_KEY in cf) else None),
+                    position=(cf.get(PD_PERSON_POSITION_KEY) if PD_PERSON_POSITION_KEY in cf else None),
+                    linkedin_url=(cf.get(PD_PERSON_LINKEDIN_KEY) if PD_PERSON_LINKEDIN_KEY in cf else None),
+                )
+
+                results["updated"] += 1
+                return
+
+            # organization
+            patch: dict[str, Any] = {}
+
+            do, v = _cell_value(row.get("name"))
+            if do:
+                patch["name"] = v
+            do, v = _cell_value(row.get("address"))
+            if do:
+                patch["address"] = v
+            do, v = _cell_value(row.get("website"))
+            if do:
+                patch["website"] = v
+
+            if not patch:
+                results["skipped"] += 1
+                return
+
+            async with sem:
+                await pipedrive_patch_v2("organizations", rid, patch, headers)
+
+            await db_upsert_org_cache_partial(
+                rid,
+                name=patch.get("name") if "name" in patch else None,
+                address=patch.get("address") if "address" in patch else None,
+                website=patch.get("website") if "website" in patch else None,
+            )
+            results["updated"] += 1
+
+        except Exception as e:
+            results["failed"] += 1
+            results["errors"].append({"id": row.get("id"), "error": str(e)})
+
+    tasks = [handle_row(r) for r in rdr]
+    if tasks:
+        await asyncio.gather(*tasks)
+
+    return JSONResponse({"ok": True, "result": results})
 
 def _freelancer_filter_sql_alias(mode: str, alias: str, param_no: int) -> str:
     """
@@ -1097,6 +1383,24 @@ def page_shell(title: str, body_html: str) -> str:
         {body_html}
       </div>
       <script>
+function _selectedIds(){{
+  const xs = Array.from(document.querySelectorAll("input.rowchk:checked"));
+  return xs.map(x => x.value).join(",");
+}}
+function bulkExport(entity){{
+  const ids = _selectedIds();
+  if(!ids){{
+    alert("Bitte mindestens einen Datensatz auswählen.");
+    return;
+  }}
+  window.location.href = "/dq/bulk/csv?entity=" + encodeURIComponent(entity) + "&ids=" + encodeURIComponent(ids);
+}}
+function toggleAllRows(masterId){{
+  const m = document.getElementById(masterId);
+  const checked = m ? m.checked : false;
+  document.querySelectorAll("input.rowchk").forEach(x => {{ x.checked = checked; }});
+}}
+
         async function updateField(entityType, id, fieldKey){{
           const inp = document.getElementById(`inp_${{entityType}}_${{id}}_${{fieldKey}}`);
           const val = inp ? inp.value : "";
@@ -1397,6 +1701,69 @@ async def db_fetch_person_detail(person_id: int) -> dict:
     return dict(row) if row else {}
 
 
+
+
+async def db_upsert_person_cache_partial(
+    person_id: int,
+    *,
+    first_name: Optional[str] = None,
+    last_name: Optional[str] = None,
+    gender: Optional[str] = None,
+    email: Optional[str] = None,
+    du_sie: Optional[str] = None,
+    position: Optional[str] = None,
+    linkedin_url: Optional[str] = None,
+    org_id: Optional[int] = None,
+    label_ids: Optional[list[int]] = None,
+):
+    """
+    Upsert in persons_cache, aber nur Felder überschreiben, die übergeben wurden.
+
+    Konvention:
+    - None bedeutet: Feld nicht anfassen
+    - "" (leerer String) bedeutet: Feld bewusst leeren
+
+    Hinweis: gender/du_sie werden im Cache als TEXT (Option-ID) gespeichert.
+    """
+    if not db_pool:
+        return
+
+    now = _utcnow()
+
+    sql = """
+    INSERT INTO persons_cache
+      (id, first_name, last_name, gender, email, du_sie, position, linkedin_url, org_id, update_time, label_ids)
+    VALUES
+      ($1, COALESCE($2,''), COALESCE($3,''), COALESCE($4,''), COALESCE($5,''), COALESCE($6,''), COALESCE($7,''), COALESCE($8,''), $9, $10, $11)
+    ON CONFLICT (id) DO UPDATE SET
+      first_name   = COALESCE($2, persons_cache.first_name),
+      last_name    = COALESCE($3, persons_cache.last_name),
+      gender       = COALESCE($4, persons_cache.gender),
+      email        = COALESCE($5, persons_cache.email),
+      du_sie       = COALESCE($6, persons_cache.du_sie),
+      position     = COALESCE($7, persons_cache.position),
+      linkedin_url = COALESCE($8, persons_cache.linkedin_url),
+      org_id       = COALESCE($9, persons_cache.org_id),
+      update_time  = $10,
+      label_ids    = COALESCE($11, persons_cache.label_ids)
+    """
+
+    async with db_pool.acquire() as conn:
+        await conn.execute(
+            sql,
+            int(person_id),
+            first_name,
+            last_name,
+            gender,
+            email,
+            du_sie,
+            position,
+            linkedin_url,
+            org_id,
+            now,
+            label_ids,
+        )
+
 def _freelancer_filter_sql(mode: str) -> str:
     """
     mode:
@@ -1456,6 +1823,14 @@ async def _render_missing_list(
     sql: str,
     freelancer_mode: str = "exclude",
 ) -> HTMLResponse:
+    """
+    Standard-Listen-Renderer für "fehlende Daten" (Kontakte/Freelancer).
+
+    Neu:
+    - Checkbox-Auswahl
+    - CSV Export der Auswahl
+    - CSV Import (Bulk Update)
+    """
     async with db_pool.acquire() as conn:
         if freelancer_mode in ("only", "exclude"):
             rows = await conn.fetch(sql, after_id, limit, FREELANCER_ORG_NAME)
@@ -1471,7 +1846,10 @@ async def _render_missing_list(
         ln = (r["last_name"] or "").strip() or "-"
         trs.append(f"""
           <tr>
-            <td><code class="badge">{pid}</code></td>
+            <td style="width:48px; text-align:center;">
+              <input class="rowchk" type="checkbox" value="{pid}">
+            </td>
+            <td style="width:120px;"><code class="badge">{pid}</code></td>
             <td>{html_escape(fn)}</td>
             <td>{html_escape(ln)}</td>
             <td style="width:160px;"><a class="chip" href="/dq/contacts/person/{pid}">Öffnen</a></td>
@@ -1482,7 +1860,34 @@ async def _render_missing_list(
     if rows:
         next_link = f'<a class="btn btn-outline" href="{base_path}?after_id={last_id}&limit={limit}">Weiter →</a>'
 
-    subtitle = "Kontakte (ohne Freelancer)" if freelancer_mode == "exclude" else ("Nur Freelancer" if freelancer_mode == "only" else "Alle Kontakte")
+    subtitle = (
+        "Kontakte (ohne Freelancer)"
+        if freelancer_mode == "exclude"
+        else ("Nur Freelancer" if freelancer_mode == "only" else "Alle Kontakte")
+    )
+
+    bulk_panel = """
+      <div class="panel" style="margin-bottom:12px;">
+        <div style="display:flex; gap:10px; flex-wrap:wrap; align-items:center; justify-content:space-between;">
+          <div style="display:flex; gap:10px; flex-wrap:wrap; align-items:center;">
+            <label class="small" style="display:flex; align-items:center; gap:8px;">
+              <input id="chk_all_rows" type="checkbox" onchange="toggleAllRows('chk_all_rows')">
+              Alle auswählen
+            </label>
+            <button class="btn btn-outline" onclick="bulkExport('person')">CSV Export (Auswahl)</button>
+          </div>
+
+          <form method="post" action="/dq/bulk/csv/import?entity=person" enctype="multipart/form-data" style="display:flex; gap:10px; align-items:center; flex-wrap:wrap;">
+            <span class="small">CSV Import:</span>
+            <input type="file" name="file" accept=".csv,text/csv" required>
+            <button class="btn btn-primary" type="submit" onclick="return confirm('CSV importieren und Datensätze in Pipedrive aktualisieren?')">Import & Update</button>
+          </form>
+        </div>
+        <div class="small" style="margin-top:8px; opacity:.9;">
+          Hinweise: Leere Zellen werden <b>nicht</b> geändert. Wert <code>__CLEAR__</code> leert ein Feld.
+        </div>
+      </div>
+    """
 
     body = f"""
       <div class="topbar">
@@ -1496,10 +1901,13 @@ async def _render_missing_list(
         </div>
       </div>
 
+      {bulk_panel}
+
       <div class="panel">
         <table>
           <thead>
             <tr>
+              <th style="width:48px; text-align:center;"><input id="chk_all_rows_header" type="checkbox" onchange="toggleAllRows('chk_all_rows_header')"></th>
               <th style="width:120px;">ID</th>
               <th>Vorname</th>
               <th>Nachname</th>
@@ -1507,13 +1915,12 @@ async def _render_missing_list(
             </tr>
           </thead>
           <tbody>
-            {''.join(trs) if trs else '<tr><td colspan="4">✅ Keine Treffer (oder Cache noch nicht vollständig).</td></tr>'}
+            {''.join(trs) if trs else '<tr><td colspan="5">✅ Keine Treffer.</td></tr>'}
           </tbody>
         </table>
       </div>
     """
     return HTMLResponse(page_shell(title, body))
-
 
 async def _db_collect_invalid_person_name_rows(
     col: str,
