@@ -3,13 +3,16 @@ import re
 import json
 import csv
 import io
+import uuid
 import httpx
 import asyncio
 import asyncpg
 import unicodedata
 from typing import Any, Optional
 
-from fastapi import FastAPI, Request, Body, UploadFile, File, Query
+from openpyxl import Workbook, load_workbook
+
+from fastapi import FastAPI, Request, Body, UploadFile, File, Query, Form
 from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from datetime import datetime, timezone, timedelta
@@ -105,7 +108,16 @@ async def init_db():
         );
         """)
 
-        # Schema-Migration (bestehende DBs)
+        
+        await conn.execute("""
+        CREATE TABLE IF NOT EXISTS bulk_staging (
+          token TEXT PRIMARY KEY,
+          entity_type TEXT NOT NULL,
+          created_at TIMESTAMPTZ NOT NULL,
+          rows JSONB NOT NULL
+        );
+        """)
+# Schema-Migration (bestehende DBs)
         await conn.execute("ALTER TABLE persons_cache ADD COLUMN IF NOT EXISTS first_name TEXT;")
         await conn.execute("ALTER TABLE persons_cache ADD COLUMN IF NOT EXISTS last_name TEXT;")
         await conn.execute("ALTER TABLE persons_cache ADD COLUMN IF NOT EXISTS gender TEXT;")
@@ -444,7 +456,7 @@ async def dq_bulk_csv_export(entity: str = Query(...), ids: str = Query(...)):
 
 def _cell_value(raw: Any) -> tuple[bool, Optional[str]]:
     """
-    CSV Import Semantik:
+    Excel Import Semantik:
     - leere Zelle => (False, None) = "nicht anfassen"
     - '__CLEAR__' => (True, None)  = "Feld leeren"
     - sonst => (True, value)
@@ -463,9 +475,114 @@ def _sniff_delimiter(sample: str) -> str:
     for delim in [";", ",", "\t"]:
         if sample.count(delim) >= 2:
             return delim
-    return ";"
+    return
 
+@app.get("/dq/bulk/xlsx")
+async def dq_bulk_xlsx_export(entity: str, ids: str):
+    """
+    Excel-Export (.xlsx) für Bulk-Bearbeitung.
+    Query:
+      - entity: "person" | "organization"
+      - ids: comma-separated IDs
+    """
+    if "default" not in user_tokens:
+        return RedirectResponse("/login")
+    if not db_pool:
+        return JSONResponse({"ok": False, "error": "DB nicht initialisiert"}, status_code=500)
 
+    entity = (entity or "").strip().lower()
+    if entity not in ("person", "organization"):
+        return JSONResponse({"ok": False, "error": "entity muss 'person' oder 'organization' sein"}, status_code=400)
+
+    id_list: list[int] = []
+    for part in (ids or "").split(","):
+        part = part.strip()
+        if part.isdigit():
+            id_list.append(int(part))
+    id_list = list(dict.fromkeys(id_list))  # unique, keep order
+    if not id_list:
+        return JSONResponse({"ok": False, "error": "Keine gültigen IDs übergeben"}, status_code=400)
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "bulk"
+
+    if entity == "person":
+        headers = [
+            "id",
+            "first_name",
+            "last_name",
+            "email",
+            "gender_id",
+            "du_sie_id",
+            "position",
+            "linkedin_url",
+        ]
+        ws.append(headers)
+
+        sql = """
+        SELECT id, first_name, last_name, email, gender, du_sie, position, linkedin_url
+        FROM persons_cache
+        WHERE id = ANY($1::bigint[])
+        ORDER BY id
+        """
+        async with db_pool.acquire() as conn:
+            rows = await conn.fetch(sql, id_list)
+
+        for r in rows:
+            ws.append([
+                int(r["id"]),
+                (r["first_name"] or "").strip(),
+                (r["last_name"] or "").strip(),
+                (r["email"] or "").strip(),
+                (r["gender"] or "").strip(),     # option id als string
+                (r["du_sie"] or "").strip(),     # option id als string
+                (r["position"] or "").strip(),
+                (r["linkedin_url"] or "").strip(),
+            ])
+
+    else:
+        headers = ["id", "name", "address", "website"]
+        ws.append(headers)
+
+        sql = """
+        SELECT id, name, address, website
+        FROM orgs_cache
+        WHERE id = ANY($1::bigint[])
+        ORDER BY id
+        """
+        async with db_pool.acquire() as conn:
+            rows = await conn.fetch(sql, id_list)
+
+        for r in rows:
+            ws.append([
+                int(r["id"]),
+                (r["name"] or "").strip(),
+                (r["address"] or "").strip(),
+                (r["website"] or "").strip(),
+            ])
+
+    # Autosize (simple)
+    for col in ws.columns:
+        max_len = 0
+        col_letter = col[0].column_letter
+        for cell in col:
+            v = "" if cell.value is None else str(cell.value)
+            if len(v) > max_len:
+                max_len = len(v)
+        ws.column_dimensions[col_letter].width = min(max(10, max_len + 2), 60)
+
+    bio = io.BytesIO()
+    wb.save(bio)
+    bio.seek(0)
+
+    filename = f"{entity}_bulk_export.xlsx"
+    headers = {"Content-Disposition": f'attachment; filename="{filename}"'}
+    return StreamingResponse(
+        bio,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers=headers,
+    )
 @app.post("/dq/bulk/csv/import")
 async def dq_bulk_csv_import(entity: str = Query(...), file: UploadFile = File(...)):
     """
@@ -611,6 +728,383 @@ async def dq_bulk_csv_import(entity: str = Query(...), file: UploadFile = File(.
         await asyncio.gather(*tasks)
 
     return JSONResponse({"ok": True, "result": results})
+
+
+
+def _xlsx_cell_to_str(v: Any) -> str:
+    if v is None:
+        return ""
+    # Excel kann Zahlen als float liefern
+    if isinstance(v, float):
+        if v.is_integer():
+            return str(int(v))
+        return str(v)
+    return str(v).strip()
+
+
+def _parse_xlsx_upload(file_bytes: bytes) -> tuple[list[str], list[dict]]:
+    """
+    Liest das erste Sheet aus einer .xlsx und gibt (headers, rows) zurück.
+    - Header = erste Zeile
+    - Leere Zeilen werden übersprungen
+    """
+    wb = load_workbook(filename=io.BytesIO(file_bytes), data_only=True)
+    ws = wb.active
+
+    # Header
+    header_row = next(ws.iter_rows(min_row=1, max_row=1, values_only=True), None)
+    if not header_row:
+        return [], []
+
+    headers = [_xlsx_cell_to_str(h).strip() for h in header_row]
+    norm_headers = [h.strip() for h in headers]
+
+    out_rows: list[dict] = []
+    for row in ws.iter_rows(min_row=2, values_only=True):
+        vals = [_xlsx_cell_to_str(v) for v in row]
+        if all((v.strip() == "" for v in vals)):
+            continue
+        d = {}
+        for i, h in enumerate(norm_headers):
+            if not h:
+                continue
+            d[h] = vals[i] if i < len(vals) else ""
+        out_rows.append(d)
+
+    return headers, out_rows
+
+
+async def _bulk_stage_save(token: str, entity: str, rows: list[dict]) -> None:
+    if not db_pool:
+        return
+    async with db_pool.acquire() as conn:
+        await conn.execute(
+            """
+            INSERT INTO bulk_staging(token, entity_type, created_at, rows)
+            VALUES($1, $2, $3, $4::jsonb)
+            ON CONFLICT(token) DO UPDATE SET
+              entity_type = EXCLUDED.entity_type,
+              created_at  = EXCLUDED.created_at,
+              rows        = EXCLUDED.rows
+            """,
+            token,
+            entity,
+            _utcnow(),
+            json.dumps(rows, ensure_ascii=False),
+        )
+
+
+async def _bulk_stage_load(token: str) -> tuple[Optional[str], list[dict]]:
+    if not db_pool:
+        return None, []
+    async with db_pool.acquire() as conn:
+        row = await conn.fetchrow("SELECT entity_type, rows FROM bulk_staging WHERE token=$1", token)
+    if not row:
+        return None, []
+    entity = row["entity_type"]
+    rows_json = row["rows"]
+    # asyncpg kann jsonb als dict/list liefern oder als str (je nach config)
+    if isinstance(rows_json, str):
+        rows = json.loads(rows_json) if rows_json else []
+    else:
+        rows = rows_json or []
+    if not isinstance(rows, list):
+        rows = []
+    return entity, rows
+
+
+async def _bulk_stage_delete(token: str) -> None:
+    if not db_pool:
+        return
+    async with db_pool.acquire() as conn:
+        await conn.execute("DELETE FROM bulk_staging WHERE token=$1", token)
+
+
+@app.post("/dq/bulk/xlsx/preview", response_class=HTMLResponse)
+async def dq_bulk_xlsx_preview(entity: str = Form(...), xlsx_file: UploadFile = File(...)):
+    """
+    Upload einer Excel-Datei -> Vorschau (OHNE Update nach Pipedrive).
+    Erst im 2. Schritt (Apply) werden Änderungen gesendet.
+    """
+    if "default" not in user_tokens:
+        return RedirectResponse("/login")
+    if not db_pool:
+        return HTMLResponse("DB nicht initialisiert", status_code=500)
+
+    entity = (entity or "").strip().lower()
+    if entity not in ("person", "organization"):
+        return HTMLResponse("Ungültige entity (person|organization)", status_code=400)
+
+    content = await xlsx_file.read()
+    headers, rows = _parse_xlsx_upload(content)
+
+    if not headers or not rows:
+        body = """
+        <div class="topbar">
+          <div>
+            <div class="title">Excel Import – Vorschau</div>
+            <div class="subtitle">Keine Daten gefunden (Header fehlt oder Datei leer).</div>
+          </div>
+          <div style="display:flex; gap:10px;">
+            <a class="btn btn-outline" href="/dq/bulk">← Zurück</a>
+          </div>
+        </div>
+        """
+        return HTMLResponse(page_shell("Excel Import – Vorschau", body))
+
+    # Erwartete Spalten
+    if entity == "person":
+        expected = {"id", "first_name", "last_name", "email", "gender_id", "du_sie_id", "position", "linkedin_url"}
+    else:
+        expected = {"id", "name", "address", "website"}
+
+    missing_cols = [c for c in ("id",) if c not in [h.strip() for h in headers]]
+    if missing_cols:
+        body = f"""
+        <div class="topbar">
+          <div>
+            <div class="title">Excel Import – Vorschau</div>
+            <div class="subtitle">Fehlende Pflicht-Spalten: <b>{html_escape(", ".join(missing_cols))}</b></div>
+          </div>
+          <div style="display:flex; gap:10px;">
+            <a class="btn btn-outline" href="/dq/bulk">← Zurück</a>
+          </div>
+        </div>
+        """
+        return HTMLResponse(page_shell("Excel Import – Vorschau", body))
+
+    # Rows normalisieren: nur bekannte Keys behalten
+    cleaned: list[dict] = []
+    preview_rows = []
+    for idx, r in enumerate(rows):
+        rr = {k.strip(): (r.get(k, "") if isinstance(r, dict) else "") for k in expected}
+        # id normalisieren
+        pid_raw = (rr.get("id") or "").strip()
+        ok = pid_raw.isdigit()
+        err = "" if ok else "ID fehlt/ungültig"
+        rr["_ok"] = ok
+        rr["_err"] = err
+        rr["_idx"] = idx
+        cleaned.append(rr)
+        preview_rows.append(rr)
+
+    token = str(uuid.uuid4())
+    await _bulk_stage_save(token, entity, cleaned)
+
+    # Preview Table
+    ths = ["✓", "Status"] + [h for h in cleaned[0].keys() if not h.startswith("_")]
+    # Der key-order oben kommt aus expected; wir bauen manuell:
+    if entity == "person":
+        col_order = ["id", "first_name", "last_name", "email", "gender_id", "du_sie_id", "position", "linkedin_url"]
+    else:
+        col_order = ["id", "name", "address", "website"]
+
+    trs = []
+    for r in preview_rows[:500]:
+        ok = bool(r.get("_ok"))
+        err = r.get("_err") or ""
+        idx = int(r.get("_idx"))
+        chk = f'<input type="checkbox" class="bulk-check" data-idx="{idx}" {"checked" if ok else ""} {"disabled" if not ok else ""}/>'
+        status = "OK" if ok else f"Fehler: {html_escape(err)}"
+        tds = [f"<td>{chk}</td>", f"<td>{status}</td>"]
+        for c in col_order:
+            tds.append(f"<td>{html_escape((r.get(c) or '').strip())}</td>")
+        trs.append("<tr>" + "".join(tds) + "</tr>")
+
+    note_clear = """
+    <div class="small" style="margin-top:10px;">
+      Hinweis: Leere Zellen bedeuten <b>keine Änderung</b>. Wenn du ein Feld in Pipedrive aktiv leeren willst,
+      trage in Excel den Wert <code>__CLEAR__</code> ein.
+    </div>
+    """
+
+    body = f"""
+      <div class="topbar">
+        <div>
+          <div class="title">Excel Import – Vorschau</div>
+          <div class="subtitle">Es wird <b>nichts</b> automatisch nach Pipedrive geschrieben. Bitte wähle die Zeilen aus und klicke anschließend auf „Änderungen anwenden“.</div>
+        </div>
+        <div style="display:flex; gap:10px;">
+          <a class="btn btn-outline" href="/dq/bulk">← Zurück</a>
+          <button class="btn btn-primary" onclick="applyBulkXlsx('{token}')">Änderungen anwenden</button>
+        </div>
+      </div>
+
+      <div class="panel">
+        <table>
+          <thead>
+            <tr>
+              <th style="width:60px;">✓</th>
+              <th style="width:220px;">Status</th>
+              {''.join(f'<th>{html_escape(c)}</th>' for c in col_order)}
+            </tr>
+          </thead>
+          <tbody>
+            {''.join(trs)}
+          </tbody>
+        </table>
+        {note_clear}
+      </div>
+
+      <script>
+        async function applyBulkXlsx(token) {{
+          if(!confirm("Wirklich ausgewählte Zeilen nach Pipedrive übernehmen?")) return;
+
+          const checks = Array.from(document.querySelectorAll(".bulk-check"));
+          const selected = checks.filter(c => c.checked && !c.disabled).map(c => parseInt(c.dataset.idx));
+
+          const res = await fetch("/dq/bulk/xlsx/apply", {{
+            method: "POST",
+            headers: {{"Content-Type":"application/json"}},
+            body: JSON.stringify({{ token, selected }})
+          }});
+
+          let data = null;
+          try {{ data = await res.json(); }} catch(e) {{}}
+
+          if(res.ok && data && data.ok) {{
+            alert("✅ Fertig. Erfolgreich: " + data.applied + " · Fehler: " + data.failed);
+            window.location.href = "/dq/bulk";
+          }} else {{
+            alert("❌ Fehler: " + ((data && data.error) ? data.error : ("HTTP " + res.status)));
+          }}
+        }}
+      </script>
+    """
+    return HTMLResponse(page_shell("Excel Import – Vorschau", body))
+
+
+@app.post("/dq/bulk/xlsx/apply")
+async def dq_bulk_xlsx_apply(payload: dict = Body(...)):
+    """
+    Apply staged Excel-Änderungen nach Pipedrive (NUR nach explizitem Klick).
+    payload: { token: "...", selected: [rowIndex,...] }
+    """
+    if "default" not in user_tokens:
+        return JSONResponse({"ok": False, "error": "Nicht eingeloggt"}, status_code=401)
+
+    token = (payload.get("token") or "").strip()
+    selected = payload.get("selected") or []
+    if not token:
+        return JSONResponse({"ok": False, "error": "token fehlt"}, status_code=400)
+    if not isinstance(selected, list) or not all(isinstance(x, int) for x in selected):
+        return JSONResponse({"ok": False, "error": "selected muss List[int] sein"}, status_code=400)
+
+    entity, rows = await _bulk_stage_load(token)
+    if not entity or not rows:
+        return JSONResponse({"ok": False, "error": "Staging nicht gefunden/leer (token abgelaufen?)"}, status_code=404)
+
+    headers = get_headers()
+    if not headers:
+        return JSONResponse({"ok": False, "error": "Nicht eingeloggt"}, status_code=401)
+
+    selected_set = set(selected)
+    applied = 0
+    failed = 0
+    errors: list[str] = []
+
+    # Apply in der Reihenfolge der Datei
+    for r in rows:
+        try:
+            idx = int(r.get("_idx", -1))
+        except Exception:
+            idx = -1
+        if idx not in selected_set:
+            continue
+
+        pid_raw = (r.get("id") or "").strip()
+        if not pid_raw.isdigit():
+            failed += 1
+            continue
+
+        entity_id = int(pid_raw)
+
+        try:
+            if entity == "person":
+                patch: dict = {}
+                cf: dict = {}
+
+                def _maybe_set_root(key: str, col: str):
+                    v = (r.get(col) or "").strip()
+                    if v == "":
+                        return
+                    if v == "__CLEAR__":
+                        patch[key] = None
+                    else:
+                        patch[key] = v
+
+                _maybe_set_root("first_name", "first_name")
+                _maybe_set_root("last_name", "last_name")
+
+                # email -> emails array
+                email_v = (r.get("email") or "").strip()
+                if email_v != "":
+                    if email_v == "__CLEAR__":
+                        patch["emails"] = []
+                    else:
+                        patch["emails"] = [{"label": "work", "value": email_v, "primary": True}]
+
+                # custom fields
+                gender_v = (r.get("gender_id") or "").strip()
+                if gender_v != "":
+                    if gender_v == "__CLEAR__":
+                        cf[PD_PERSON_GENDER_KEY] = None
+                    elif gender_v.isdigit():
+                        cf[PD_PERSON_GENDER_KEY] = int(gender_v)
+
+                dusie_v = (r.get("du_sie_id") or "").strip()
+                if dusie_v != "":
+                    if dusie_v == "__CLEAR__":
+                        cf[PD_PERSON_DU_SIE_KEY] = None
+                    elif dusie_v.isdigit():
+                        cf[PD_PERSON_DU_SIE_KEY] = int(dusie_v)
+
+                pos_v = (r.get("position") or "").strip()
+                if pos_v != "":
+                    cf[PD_PERSON_POSITION_KEY] = None if pos_v == "__CLEAR__" else pos_v
+
+                li_v = (r.get("linkedin_url") or "").strip()
+                if li_v != "":
+                    cf[PD_PERSON_LINKEDIN_KEY] = None if li_v == "__CLEAR__" else li_v
+
+                if cf:
+                    patch["custom_fields"] = cf
+
+                if patch:
+                    await pipedrive_patch_v2("persons", entity_id, patch, headers)
+                    await refresh_person_cache_from_api(entity_id, headers)
+                    applied += 1
+
+            else:
+                patch: dict = {}
+                for col in ("name", "address", "website"):
+                    v = (r.get(col) or "").strip()
+                    if v == "":
+                        continue
+                    if v == "__CLEAR__":
+                        patch[col] = None
+                    else:
+                        patch[col] = v
+
+                if patch:
+                    await pipedrive_patch_v2("organizations", entity_id, patch, headers)
+                    await refresh_org_cache_from_api(entity_id, headers)
+                    applied += 1
+
+        except Exception as e:
+            failed += 1
+            errors.append(f"ID {entity_id}: {str(e)}")
+
+    # Staging löschen (damit kein Re-Apply aus Versehen)
+    await _bulk_stage_delete(token)
+
+    return JSONResponse({
+        "ok": True,
+        "entity": entity,
+        "applied": applied,
+        "failed": failed,
+        "errors": errors[:20],
+    })
 
 def _freelancer_filter_sql_alias(mode: str, alias: str, param_no: int) -> str:
     """
@@ -1829,7 +2323,7 @@ async def _render_missing_list(
     Neu:
     - Checkbox-Auswahl
     - CSV Export der Auswahl
-    - CSV Import (Bulk Update)
+    - Excel Import (Bulk Update)
     """
     async with db_pool.acquire() as conn:
         if freelancer_mode in ("only", "exclude"):
@@ -1878,9 +2372,9 @@ async def _render_missing_list(
           </div>
 
           <form method="post" action="/dq/bulk/csv/import?entity=person" enctype="multipart/form-data" style="display:flex; gap:10px; align-items:center; flex-wrap:wrap;">
-            <span class="small">CSV Import:</span>
-            <input type="file" name="file" accept=".csv,text/csv" required>
-            <button class="btn btn-primary" type="submit" onclick="return confirm('CSV importieren und Datensätze in Pipedrive aktualisieren?')">Import & Update</button>
+            <span class="small">Excel Import:</span>
+            <input type="file" name="file" accept=".xlsx,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" required>
+            <button class="btn btn-primary" type="submit" onclick="return confirm('CSV importieren und Datensätze in Pipedrive aktualisieren?')">Upload & Vorschau</button>
           </form>
         </div>
         <div class="small" style="margin-top:8px; opacity:.9;">
