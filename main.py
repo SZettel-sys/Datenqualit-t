@@ -10,8 +10,8 @@ import asyncpg
 import unicodedata
 from typing import Any, Optional
 
-from openpyxl import Workbook, load_workbook
-
+import zipfile
+import xml.etree.ElementTree as ET
 from fastapi import FastAPI, Request, Body, UploadFile, File, Query, Form
 from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
@@ -471,6 +471,212 @@ def _cell_value(raw: Any) -> tuple[bool, Optional[str]]:
     return True, s
 
 
+# ---------------------------------------------------------------------
+# Minimal XLSX writer/reader (ohne openpyxl)
+# ---------------------------------------------------------------------
+
+_XLSX_NS_MAIN = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+_XLSX_NS_REL = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+
+def _col_letter(idx0: int) -> str:
+    """0 -> A, 25 -> Z, 26 -> AA ..."""
+    n = idx0 + 1
+    s = ""
+    while n > 0:
+        n, r = divmod(n - 1, 26)
+        s = chr(65 + r) + s
+    return s
+
+def _col_index(col_letters: str) -> int:
+    """A -> 0, Z -> 25, AA -> 26"""
+    col_letters = (col_letters or "").upper()
+    n = 0
+    for ch in col_letters:
+        if "A" <= ch <= "Z":
+            n = n * 26 + (ord(ch) - 64)
+    return max(0, n - 1)
+
+def _xlsx_make_sheet_xml(headers: list[str], rows: list[list[Any]]) -> bytes:
+    import xml.etree.ElementTree as _ET
+
+    ns = _XLSX_NS_MAIN
+    _ET.register_namespace("", ns)
+
+    ws = _ET.Element(f"{{{ns}}}worksheet")
+    sheet_data = _ET.SubElement(ws, f"{{{ns}}}sheetData")
+
+    def add_row(r_idx: int, values: list[Any]):
+        row_el = _ET.SubElement(sheet_data, f"{{{ns}}}row", {"r": str(r_idx)})
+        for c_idx, v in enumerate(values):
+            col = _col_letter(c_idx)
+            cell_ref = f"{col}{r_idx}"
+            if v is None:
+                continue
+            sv = str(v)
+            if sv == "":
+                continue
+
+            # Zahlen als Zahl, sonst inline string (kein sharedStrings nötig)
+            if isinstance(v, (int, float)) or (isinstance(v, str) and re.fullmatch(r"-?\d+(\.\d+)?", sv)):
+                c_el = _ET.SubElement(row_el, f"{{{ns}}}c", {"r": cell_ref})
+                v_el = _ET.SubElement(c_el, f"{{{ns}}}v")
+                v_el.text = sv
+            else:
+                c_el = _ET.SubElement(row_el, f"{{{ns}}}c", {"r": cell_ref, "t": "inlineStr"})
+                is_el = _ET.SubElement(c_el, f"{{{ns}}}is")
+                t_el = _ET.SubElement(is_el, f"{{{ns}}}t")
+                # preserve leading/trailing spaces
+                if sv.startswith(" ") or sv.endswith(" "):
+                    t_el.set("{http://www.w3.org/XML/1998/namespace}space", "preserve")
+                t_el.text = sv
+
+    # header row
+    add_row(1, headers)
+    # data rows
+    for i, r in enumerate(rows, start=2):
+        add_row(i, r)
+
+    return _ET.tostring(ws, encoding="utf-8", xml_declaration=True)
+
+def _make_simple_xlsx_bytes(headers: list[str], rows: list[list[Any]]) -> bytes:
+    """Erzeugt ein simples XLSX mit einem Sheet (sheet1)."""
+    from io import BytesIO
+
+    # Core XML parts
+    content_types = f'''<?xml version="1.0" encoding="UTF-8"?>
+<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
+  <Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
+  <Default Extension="xml" ContentType="application/xml"/>
+  <Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>
+  <Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>
+</Types>
+'''
+    rels = f'''<?xml version="1.0" encoding="UTF-8"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/>
+</Relationships>
+'''
+    wb = f'''<?xml version="1.0" encoding="UTF-8"?>
+<workbook xmlns="{_XLSX_NS_MAIN}" xmlns:r="{_XLSX_NS_REL}">
+  <sheets>
+    <sheet name="Sheet1" sheetId="1" r:id="rId1"/>
+  </sheets>
+</workbook>
+'''
+    wb_rels = f'''<?xml version="1.0" encoding="UTF-8"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/>
+</Relationships>
+'''
+    sheet1 = _xlsx_make_sheet_xml(headers, rows)
+
+    bio = BytesIO()
+    with zipfile.ZipFile(bio, "w", compression=zipfile.ZIP_DEFLATED) as z:
+        z.writestr("[Content_Types].xml", content_types)
+        z.writestr("_rels/.rels", rels)
+        z.writestr("xl/workbook.xml", wb)
+        z.writestr("xl/_rels/workbook.xml.rels", wb_rels)
+        z.writestr("xl/worksheets/sheet1.xml", sheet1)
+    return bio.getvalue()
+
+def _read_xlsx_first_sheet(file_bytes: bytes) -> list[list[str]]:
+    """Liest sheet1 aus einem XLSX (Zip+XML). Gibt Zeilen als Listen zurück."""
+    from io import BytesIO
+
+    with zipfile.ZipFile(BytesIO(file_bytes), "r") as z:
+        # shared strings optional
+        shared = []
+        if "xl/sharedStrings.xml" in z.namelist():
+            sroot = ET.fromstring(z.read("xl/sharedStrings.xml"))
+            ns = {"m": _XLSX_NS_MAIN}
+            for si in sroot.findall("m:si", ns):
+                t = si.find("m:t", ns)
+                if t is not None and t.text is not None:
+                    shared.append(t.text)
+                else:
+                    parts = []
+                    for rt in si.findall(".//m:t", ns):
+                        if rt.text:
+                            parts.append(rt.text)
+                    shared.append("".join(parts))
+
+        sheet_path = "xl/worksheets/sheet1.xml"
+        if sheet_path not in z.namelist():
+            ws = [p for p in z.namelist() if p.startswith("xl/worksheets/") and p.endswith(".xml")]
+            if not ws:
+                return []
+            sheet_path = ws[0]
+
+        root = ET.fromstring(z.read(sheet_path))
+        ns = {"m": _XLSX_NS_MAIN}
+
+        rows_map: dict[int, dict[int, str]] = {}
+
+        for row_el in root.findall(".//m:sheetData/m:row", ns):
+            r_attr = row_el.get("r")
+            try:
+                r_idx = int(r_attr) if r_attr else None
+            except Exception:
+                r_idx = None
+            if r_idx is None:
+                continue
+
+            cols: dict[int, str] = {}
+            for c in row_el.findall("m:c", ns):
+                ref = c.get("r") or ""
+                mref = re.match(r"^([A-Za-z]+)(\d+)$", ref)
+                if not mref:
+                    continue
+                c_idx = _col_index(mref.group(1))
+
+                t = c.get("t")
+                val = ""
+                if t == "inlineStr":
+                    t_el = c.find("m:is/m:t", ns)
+                    if t_el is not None and t_el.text is not None:
+                        val = t_el.text
+                    else:
+                        parts = []
+                        for rt in c.findall(".//m:is//m:t", ns):
+                            if rt.text:
+                                parts.append(rt.text)
+                        val = "".join(parts)
+                else:
+                    v_el = c.find("m:v", ns)
+                    if v_el is not None and v_el.text is not None:
+                        raw = v_el.text
+                        if t == "s":
+                            try:
+                                val = shared[int(raw)]
+                            except Exception:
+                                val = raw
+                        else:
+                            val = raw
+
+                cols[c_idx] = (val or "")
+
+            if cols:
+                rows_map[r_idx] = cols
+
+        if not rows_map:
+            return []
+
+        max_row = max(rows_map.keys())
+        max_col = max((max(cols.keys()) for cols in rows_map.values()), default=-1)
+
+        out: list[list[str]] = []
+        for r in range(1, max_row + 1):
+            cols = rows_map.get(r) or {}
+            row_vals = []
+            for c in range(0, max_col + 1):
+                row_vals.append((cols.get(c) or "").strip())
+            out.append(row_vals)
+
+        while out and all(x == "" for x in out[-1]):
+            out.pop()
+
+        return out
+
 def _sniff_delimiter(sample: str) -> str:
     for delim in [";", ",", "\t"]:
         if sample.count(delim) >= 2:
@@ -478,110 +684,82 @@ def _sniff_delimiter(sample: str) -> str:
     return
 
 @app.get("/dq/bulk/xlsx")
-async def dq_bulk_xlsx_export(entity: str, ids: str):
+async def dq_bulk_xlsx_export(mode: str = "contacts"):
     """
-    Excel-Export (.xlsx) für Bulk-Bearbeitung.
-    Query:
-      - entity: "person" | "organization"
-      - ids: comma-separated IDs
+    Exportiere Bulk-Excel:
+      - mode=contacts      -> Kontakte ohne Freelancer
+      - mode=freelancers   -> nur Freelancer
+      - mode=organizations -> Organisationen
     """
     if "default" not in user_tokens:
         return RedirectResponse("/login")
     if not db_pool:
         return JSONResponse({"ok": False, "error": "DB nicht initialisiert"}, status_code=500)
 
-    entity = (entity or "").strip().lower()
-    if entity not in ("person", "organization"):
-        return JSONResponse({"ok": False, "error": "entity muss 'person' oder 'organization' sein"}, status_code=400)
+    mode = (mode or "contacts").strip().lower()
+    if mode not in ("contacts", "freelancers", "organizations"):
+        return JSONResponse({"ok": False, "error": "mode muss contacts|freelancers|organizations sein"}, status_code=400)
 
-    id_list: list[int] = []
-    for part in (ids or "").split(","):
-        part = part.strip()
-        if part.isdigit():
-            id_list.append(int(part))
-    id_list = list(dict.fromkeys(id_list))  # unique, keep order
-    if not id_list:
-        return JSONResponse({"ok": False, "error": "Keine gültigen IDs übergeben"}, status_code=400)
+    async with db_pool.acquire() as conn:
+        if mode == "organizations":
+            rows = await conn.fetch(
+                "SELECT id, name, address, website FROM orgs_cache ORDER BY id"
+            )
+            headers = ["id", "name", "address", "website"]
+            data_rows = [[r["id"], r["name"], r["address"], r["website"]] for r in rows]
+            filename = "bulk_organizations.xlsx"
 
-    wb = Workbook()
-    ws = wb.active
-    ws.title = "bulk"
+        else:
+            base_sql = """
+            SELECT
+              p.id, p.first_name, p.last_name, p.gender, p.email, p.du_sie, p.position, p.linkedin_url,
+              COALESCE(o.name, '') AS org_name
+            FROM persons_cache p
+            LEFT JOIN orgs_cache o ON o.id = p.org_id
+            WHERE 1=1
+            """
 
-    if entity == "person":
-        headers = [
-            "id",
-            "first_name",
-            "last_name",
-            "email",
-            "gender_id",
-            "du_sie_id",
-            "position",
-            "linkedin_url",
-        ]
-        ws.append(headers)
+            if mode == "contacts":
+                base_sql += """ AND (o.name IS NULL OR lower(o.name) <> lower($1)) """
+                rows = await conn.fetch(base_sql + " ORDER BY p.id", FREELANCER_ORG_NAME)
+                filename = "bulk_contacts.xlsx"
+            else:
+                base_sql += """ AND (o.name IS NOT NULL AND lower(o.name) = lower($1)) """
+                rows = await conn.fetch(base_sql + " ORDER BY p.id", FREELANCER_ORG_NAME)
+                filename = "bulk_freelancers.xlsx"
 
-        sql = """
-        SELECT id, first_name, last_name, email, gender, du_sie, position, linkedin_url
-        FROM persons_cache
-        WHERE id = ANY($1::bigint[])
-        ORDER BY id
-        """
-        async with db_pool.acquire() as conn:
-            rows = await conn.fetch(sql, id_list)
+            headers = [
+                "id",
+                "first_name",
+                "last_name",
+                "gender",
+                "email",
+                "du_sie",
+                "position",
+                "linkedin_url",
+                "org_name",
+            ]
+            data_rows = [
+                [
+                    r["id"],
+                    r["first_name"],
+                    r["last_name"],
+                    r["gender"],
+                    r["email"],
+                    r["du_sie"],
+                    r["position"],
+                    r["linkedin_url"],
+                    r["org_name"],
+                ]
+                for r in rows
+            ]
 
-        for r in rows:
-            ws.append([
-                int(r["id"]),
-                (r["first_name"] or "").strip(),
-                (r["last_name"] or "").strip(),
-                (r["email"] or "").strip(),
-                (r["gender"] or "").strip(),     # option id als string
-                (r["du_sie"] or "").strip(),     # option id als string
-                (r["position"] or "").strip(),
-                (r["linkedin_url"] or "").strip(),
-            ])
+    xlsx_bytes = _make_simple_xlsx_bytes(headers, data_rows)
 
-    else:
-        headers = ["id", "name", "address", "website"]
-        ws.append(headers)
-
-        sql = """
-        SELECT id, name, address, website
-        FROM orgs_cache
-        WHERE id = ANY($1::bigint[])
-        ORDER BY id
-        """
-        async with db_pool.acquire() as conn:
-            rows = await conn.fetch(sql, id_list)
-
-        for r in rows:
-            ws.append([
-                int(r["id"]),
-                (r["name"] or "").strip(),
-                (r["address"] or "").strip(),
-                (r["website"] or "").strip(),
-            ])
-
-    # Autosize (simple)
-    for col in ws.columns:
-        max_len = 0
-        col_letter = col[0].column_letter
-        for cell in col:
-            v = "" if cell.value is None else str(cell.value)
-            if len(v) > max_len:
-                max_len = len(v)
-        ws.column_dimensions[col_letter].width = min(max(10, max_len + 2), 60)
-
-    bio = io.BytesIO()
-    wb.save(bio)
-    bio.seek(0)
-
-    filename = f"{entity}_bulk_export.xlsx"
-    headers = {"Content-Disposition": f'attachment; filename="{filename}"'}
     return StreamingResponse(
-        bio,
+        io.BytesIO(xlsx_bytes),
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        headers=headers,
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
     )
 @app.post("/dq/bulk/csv/import")
 async def dq_bulk_csv_import(entity: str = Query(...), file: UploadFile = File(...)):
@@ -745,26 +923,25 @@ def _xlsx_cell_to_str(v: Any) -> str:
 def _parse_xlsx_upload(file_bytes: bytes) -> tuple[list[str], list[dict]]:
     """
     Liest das erste Sheet aus einer .xlsx und gibt (headers, rows) zurück.
+    Implementierung ohne openpyxl (XLSX = Zip + XML).
+
     - Header = erste Zeile
     - Leere Zeilen werden übersprungen
     """
-    wb = load_workbook(filename=io.BytesIO(file_bytes), data_only=True)
-    ws = wb.active
-
-    # Header
-    header_row = next(ws.iter_rows(min_row=1, max_row=1, values_only=True), None)
-    if not header_row:
+    grid = _read_xlsx_first_sheet(file_bytes)
+    if not grid:
         return [], []
 
-    headers = [_xlsx_cell_to_str(h).strip() for h in header_row]
+    header_row = grid[0]
+    headers = [(_xlsx_cell_to_str(h) or "").strip() for h in header_row]
     norm_headers = [h.strip() for h in headers]
 
     out_rows: list[dict] = []
-    for row in ws.iter_rows(min_row=2, values_only=True):
+    for row in grid[1:]:
         vals = [_xlsx_cell_to_str(v) for v in row]
         if all((v.strip() == "" for v in vals)):
             continue
-        d = {}
+        d: dict[str, str] = {}
         for i, h in enumerate(norm_headers):
             if not h:
                 continue
