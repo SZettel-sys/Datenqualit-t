@@ -13,7 +13,7 @@ from typing import Any, Optional
 import zipfile
 import xml.etree.ElementTree as ET
 from fastapi import FastAPI, Request, Body, UploadFile, File, Query, Form
-from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse, Response
+from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from datetime import datetime, timezone, timedelta
 
@@ -425,7 +425,7 @@ async def dq_bulk_csv_export(entity: str = Query(...), ids: str = Query(...)):
 
     if entity == "person":
         rows_by_id = await db_fetch_persons_bulk(id_list)
-        writer.writerow(["id", "first_name", "last_name", "email", "gender_id", "du_sie_id", "position", "linkedin_url", "org_name"])
+        writer.writerow(["id","first_name","last_name","email","gender","du_sie","position","linkedin_url","org_name"])
         for pid in id_list:
             r = rows_by_id.get(pid) or {}
             writer.writerow([
@@ -452,6 +452,69 @@ async def dq_bulk_csv_export(entity: str = Query(...), ids: str = Query(...)):
             (r.get("website") or ""),
         ])
     return _csv_text(sio.getvalue(), f"bulk_orgs_{len(id_list)}.csv")
+
+
+@app.get("/dq/bulk/xlsx/selected")
+async def dq_bulk_xlsx_export_selected(entity: str = Query(...), ids: str = Query(...)):
+    """
+    Excel-Export (XLSX) für ausgewählte Datensätze.
+
+    entity:
+      - person
+      - organization
+    ids: comma separated
+    """
+    if "default" not in user_tokens:
+        return RedirectResponse("/login")
+    if not db_pool:
+        return JSONResponse({"ok": False, "error": "DB nicht initialisiert"}, status_code=500)
+
+    entity = (entity or "").strip().lower()
+    id_list = _parse_ids_param(ids)
+    if entity not in ("person", "organization"):
+        return JSONResponse({"ok": False, "error": "entity muss person|organization sein"}, status_code=400)
+    if not id_list:
+        return JSONResponse({"ok": False, "error": "ids leer"}, status_code=400)
+
+    if entity == "person":
+        rows_by_id = await db_fetch_persons_bulk(id_list)
+        headers = ["id", "first_name", "last_name", "email", "gender", "du_sie", "position", "linkedin_url", "org_name"]
+        data_rows: list[list[Any]] = []
+        for pid in id_list:
+            r = rows_by_id.get(pid) or {}
+            data_rows.append([
+                pid,
+                (r.get("first_name") or ""),
+                (r.get("last_name") or ""),
+                (r.get("email") or ""),
+                (r.get("gender") or ""),
+                (r.get("du_sie") or ""),
+                (r.get("position") or ""),
+                (r.get("linkedin_url") or ""),
+                (r.get("org_name") or ""),
+            ])
+        filename = f"bulk_persons_{len(id_list)}.xlsx"
+    else:
+        rows_by_id = await db_fetch_orgs_bulk(id_list)
+        headers = ["id", "name", "address", "website"]
+        data_rows = []
+        for oid in id_list:
+            r = rows_by_id.get(oid) or {}
+            data_rows.append([
+                oid,
+                (r.get("name") or ""),
+                (r.get("address") or ""),
+                (r.get("website") or ""),
+            ])
+        filename = f"bulk_orgs_{len(id_list)}.xlsx"
+
+    xlsx_bytes = _make_simple_xlsx_bytes(headers, data_rows)
+    return StreamingResponse(
+        io.BytesIO(xlsx_bytes),
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
 
 
 def _cell_value(raw: Any) -> tuple[bool, Optional[str]]:
@@ -2064,7 +2127,7 @@ function bulkExport(entity){{
     alert("Bitte mindestens einen Datensatz auswählen.");
     return;
   }}
-  window.location.href = "/dq/bulk/csv?entity=" + encodeURIComponent(entity) + "&ids=" + encodeURIComponent(ids);
+  window.location.href = "/dq/bulk/xlsx/selected?entity=" + encodeURIComponent(entity) + "&ids=" + encodeURIComponent(ids);
 }}
 function toggleAllRows(masterId){{
   const m = document.getElementById(masterId);
@@ -2545,14 +2608,8 @@ async def _render_missing_list(
               <input id="chk_all_rows" type="checkbox" onchange="toggleAllRows('chk_all_rows')">
               Alle auswählen
             </label>
-            <button class="btn btn-outline" onclick="bulkExport('person')">CSV Export (Auswahl)</button>
+            <button class="btn btn-outline" onclick="bulkExport('person')">Excel-Export</button>
           </div>
-
-          <form method="post" action="/dq/bulk/csv/import?entity=person" enctype="multipart/form-data" style="display:flex; gap:10px; align-items:center; flex-wrap:wrap;">
-            <span class="small">Excel Import:</span>
-            <input type="file" name="file" accept=".xlsx,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" required>
-            <button class="btn btn-primary" type="submit" onclick="return confirm('CSV importieren und Datensätze in Pipedrive aktualisieren?')">Upload & Vorschau</button>
-          </form>
         </div>
         <div class="small" style="margin-top:8px; opacity:.9;">
           Hinweise: Leere Zellen werden <b>nicht</b> geändert. Wert <code>__CLEAR__</code> leert ein Feld.
