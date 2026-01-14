@@ -3045,7 +3045,19 @@ async def dq_person_detail(person_id: int, saved: int = 0):
     label_ids = p.get("label_ids") or []
     if not isinstance(label_ids, list):
         label_ids = []
-    labels_text = ", ".join(str(x) for x in label_ids) if label_ids else "-"
+
+    # Labels: IDs -> Namen (über /v1/personFields -> field key "label")
+    label_opts = await get_person_field_options(headers, "label")
+    if not label_opts:
+        # Fallback, falls ein Workspace abweichende Keys nutzt
+        label_opts = await get_person_field_options(headers, "label_ids")
+    label_map = {k: v for (k, v) in (label_opts or [])}
+
+    label_names: list[str] = []
+    for lid in label_ids:
+        k = str(lid)
+        label_names.append(label_map.get(k, k))
+    labels_text = ", ".join(label_names) if label_names else "-"
 
     notice = ""
     if saved == 1:
@@ -3088,7 +3100,7 @@ async def dq_person_detail(person_id: int, saved: int = 0):
             <tr><th>Position</th><td><input class="field-input" id="position" value="{val("position")}" /></td></tr>
             <tr><th>LinkedIn-URL</th><td><input class="field-input" id="linkedin_url" value="{val("linkedin_url")}" /></td></tr>
 
-            <tr><th>Labels (IDs)</th><td><input class="field-input" value="{html_escape(labels_text)}" disabled /></td></tr>
+            <tr><th>Labels</th><td><input class="field-input" value="{html_escape(labels_text)}" disabled /></td></tr>
             <tr><th>Organisation</th><td><input class="field-input" value="{html_escape(p.get("org_name") or "-")}" disabled /></td></tr>
           </tbody>
         </table>
