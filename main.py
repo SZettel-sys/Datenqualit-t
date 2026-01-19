@@ -36,6 +36,14 @@ OAUTH_AUTHORIZE_URL = "https://oauth.pipedrive.com/oauth/authorize"
 OAUTH_TOKEN_URL = "https://oauth.pipedrive.com/oauth/token"
 PIPEDRIVE_API_V2_URL = "https://api.pipedrive.com/api/v2"
 
+PIPEDRIVE_APP_URL = os.getenv("PIPEDRIVE_APP_URL", "https://app.pipedrive.com")
+
+def pipedrive_person_url(person_id: int) -> str:
+    return f"{PIPEDRIVE_APP_URL}/person/{int(person_id)}"
+
+def pipedrive_org_url(org_id: int) -> str:
+    return f"{PIPEDRIVE_APP_URL}/organization/{int(org_id)}"
+
 user_tokens: dict[str, str] = {}
 
 ########################################################################
@@ -455,7 +463,7 @@ async def dq_bulk_csv_export(entity: str = Query(...), ids: str = Query(...)):
 
 
 @app.get("/dq/bulk/xlsx/selected")
-async def dq_bulk_xlsx_export_selected(entity: str = Query(...), ids: str = Query(...)):
+async def dq_bulk_xlsx_export_selected(entity: str = Query(...), ids: str = Query(...), field_key: str = Query("")):
     """
     Excel-Export (XLSX) für ausgewählte Datensätze.
 
@@ -478,21 +486,23 @@ async def dq_bulk_xlsx_export_selected(entity: str = Query(...), ids: str = Quer
 
     if entity == "person":
         rows_by_id = await db_fetch_persons_bulk(id_list)
-        headers = ["id", "first_name", "last_name", "email", "gender", "du_sie", "position", "linkedin_url", "org_name"]
+        base_headers = ["id", "first_name", "last_name", "org_id"]
+        fk = (field_key or "").strip()
+        headers = base_headers.copy()
+        if fk and fk not in headers:
+            headers.append(fk)
         data_rows: list[list[Any]] = []
         for pid in id_list:
             r = rows_by_id.get(pid) or {}
-            data_rows.append([
+            row = [
                 pid,
                 (r.get("first_name") or ""),
                 (r.get("last_name") or ""),
-                (r.get("email") or ""),
-                (r.get("gender") or ""),
-                (r.get("du_sie") or ""),
-                (r.get("position") or ""),
-                (r.get("linkedin_url") or ""),
-                (r.get("org_name") or ""),
-            ])
+                (r.get("org_id") or ""),
+            ]
+            if fk and fk not in base_headers:
+                row.append((r.get(fk) or ""))
+            data_rows.append(row)
         filename = f"bulk_persons_{len(id_list)}.xlsx"
     else:
         rows_by_id = await db_fetch_orgs_bulk(id_list)
@@ -1432,6 +1442,28 @@ async def db_count_persons_title_in_firstname(freelancer_mode: str = "exclude") 
     return await _db_count(sql, *params)
 
 
+async def db_count_persons_without_org(freelancer_mode: str = "exclude") -> Optional[int]:
+    flt = _freelancer_filter_sql_alias(freelancer_mode, "p", 1)
+    params = []
+    if flt.strip():
+        params.append(FREELANCER_ORG_NAME)
+    sql = f"""
+      SELECT COUNT(*) FROM persons_cache p
+      WHERE p.org_id IS NULL
+      {flt}
+    """
+    return await _db_count(sql, *params)
+
+
+async def db_count_orgs_without_contacts() -> Optional[int]:
+    sql = """
+      SELECT COUNT(*)
+      FROM orgs_cache o
+      WHERE NOT EXISTS (SELECT 1 FROM persons_cache p WHERE p.org_id = o.id)
+    """
+    return await _db_count(sql)
+
+
 async def db_count_orgs_missing(field: str) -> Optional[int]:
     if field not in ("name", "address", "website"):
         return None
@@ -1473,6 +1505,8 @@ async def compute_overview_counts() -> dict[str, Optional[int]]:
     counts["/dq/contacts/du_sie/missing"] = await db_count_persons_missing("du_sie", "exclude")
     counts["/dq/contacts/position/missing"] = await db_count_persons_missing("position", "exclude")
     counts["/dq/contacts/linkedin/missing"] = await db_count_persons_missing("linkedin_url", "exclude")
+    counts["/dq/contacts/org/missing"] = await db_count_persons_without_org("exclude")
+    counts["/dq/contacts/email/mismatch"] = None  # bewusst nicht gezählt (Heuristik/teurer)
 
     # Freelancer (nur Organisation = Freelancer)
     counts["/dq/freelancers/first_name/missing"] = await db_count_persons_missing("first_name", "only")
@@ -1487,6 +1521,7 @@ async def compute_overview_counts() -> dict[str, Optional[int]]:
     counts["/dq/orgs/missing?field=name"] = await db_count_orgs_missing("name")
     counts["/dq/orgs/missing?field=address"] = await db_count_orgs_missing("address")
     counts["/dq/orgs/missing?field=website"] = await db_count_orgs_missing("website")
+    counts["/dq/orgs/no_contacts"] = await db_count_orgs_without_contacts()
     counts["/dq/orgs/invalidchars?field=name"] = await db_count_orgs_invalid_name()
 
     return counts
@@ -1642,6 +1677,17 @@ async def pipedrive_patch_v2(entity: str, entity_id: int, payload: dict, headers
         if r.status_code in (200, 201):
             return r.json()
         raise RuntimeError(f"Update fehlgeschlagen ({r.status_code}): {r.text}")
+
+
+async def pipedrive_delete_v2(entity: str, entity_id: int, headers: dict) -> None:
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        r = await client.delete(
+            f"{PIPEDRIVE_API_V2_URL}/{entity}/{entity_id}",
+            headers=headers,
+        )
+    if r.status_code in (200, 204):
+        return
+    raise RuntimeError(f"Delete fehlgeschlagen ({r.status_code}): {r.text}")
 
 
 def normalize_update_payload_v2(entity_type: str, field_key: str, value: str) -> dict:
@@ -2108,55 +2154,90 @@ def page_shell(title: str, body_html: str) -> str:
     <head>
       <meta charset="utf-8"/>
       <meta name="viewport" content="width=device-width, initial-scale=1"/>
-      <title>{html_escape(title)}</title>
-      <link rel="stylesheet" href="/static/app.css?v={CSS_VERSION}">
+      <title>{{html_escape(title)}}</title>
+      <link rel="stylesheet" href="/static/app.css?v={{CSS_VERSION}}">
+      <style>
+        .backbar{{display:flex; justify-content:flex-end; margin:10px 0 18px; gap:10px; flex-wrap:wrap;}}
+        .chip{{display:inline-flex; align-items:center; gap:6px; padding:6px 10px; border-radius:999px;
+              text-decoration:none; border:1px solid rgba(15,23,42,.14); background:#fff; font-size:13px;}}
+        .chip:hover{{border-color: rgba(2,132,199,.35);}}
+        .chip-link{{border-color: rgba(2,132,199,.35); color:#075985;}}
+        .chip-primary{{border-color: rgba(14,165,233,.35); color:#075985; background: rgba(14,165,233,.06);}}
+        .chip-danger{{border-color: rgba(239,68,68,.35); color:#b91c1c; background: rgba(239,68,68,.06); cursor:pointer;}}
+        .chip-danger:hover{{border-color: rgba(239,68,68,.6);}}
+        .btn-inline{{padding:6px 12px; border-radius:12px;}}
+      </style>
     </head>
     <body>
-      {logo_html}
+      {{logo_html}}
       <div class="container">
-        {body_html}
+        <div class="backbar">
+          <button class="btn btn-outline btn-inline" onclick="goBack()">← Zurück</button>
+          <a class="btn btn-outline btn-inline" href="/overview">Übersicht</a>
+        </div>
+        {{body_html}}
       </div>
       <script>
-function _selectedIds(){{
+function goBack(){
+  if(window.history.length > 1) window.history.back();
+  else window.location.href = "/overview";
+}
+function _selectedIds(){
   const xs = Array.from(document.querySelectorAll("input.rowchk:checked"));
   return xs.map(x => x.value).join(",");
-}}
-function bulkExport(entity){{
+}
+function bulkExport(entity, fieldKey){
   const ids = _selectedIds();
-  if(!ids){{
+  if(!ids){
     alert("Bitte mindestens einen Datensatz auswählen.");
     return;
-  }}
-  window.location.href = "/dq/bulk/xlsx/selected?entity=" + encodeURIComponent(entity) + "&ids=" + encodeURIComponent(ids);
-}}
-function toggleAllRows(masterId){{
+  }
+  const fk = fieldKey ? ("&field_key=" + encodeURIComponent(fieldKey)) : "";
+  window.location.href = "/dq/bulk/xlsx/selected?entity=" + encodeURIComponent(entity) + "&ids=" + encodeURIComponent(ids) + fk;
+}
+function toggleAllRows(masterId){
   const m = document.getElementById(masterId);
   const checked = m ? m.checked : false;
-  document.querySelectorAll("input.rowchk").forEach(x => {{ x.checked = checked; }});
-}}
+  document.querySelectorAll("input.rowchk").forEach(x => { x.checked = checked; });
+}
 
-        async function updateField(entityType, id, fieldKey){{
-          const inp = document.getElementById(`inp_${{entityType}}_${{id}}_${{fieldKey}}`);
+async function deletePerson(id, redirectUrl){
+  if(!confirm("Kontakt wirklich in Pipedrive löschen?
+
+Hinweis: Das kann nicht rückgängig gemacht werden.")) return;
+  const res = await fetch(`/dq/contacts/person/${id}/delete`, {method:"POST"});
+  const data = await res.json().catch(()=>null);
+  if(res.ok && data && data.ok){
+    alert("✅ Kontakt gelöscht");
+    if(redirectUrl){ window.location.href = redirectUrl; }
+    else { location.reload(); }
+  } else {
+    alert("❌ Fehler: " + ((data && data.error) ? data.error : ("HTTP " + res.status)));
+  }
+}
+
+        async function updateField(entityType, id, fieldKey){
+          const inp = document.getElementById(`inp_${entityType}_${id}_${fieldKey}`);
           const val = inp ? inp.value : "";
           if(!confirm("Wirklich in Pipedrive aktualisieren?")) return;
 
-          const res = await fetch("/dq/update", {{
+          const res = await fetch("/dq/update", {
             method:"POST",
-            headers:{{"Content-Type":"application/json"}},
-            body: JSON.stringify({{
+            headers:{"Content-Type":"application/json"},
+            body: JSON.stringify({
               entity_type: entityType,
               entity_id: parseInt(id),
               field_key: fieldKey,
               value: val
-            }})
-          }});
+            })
+          });
           const data = await res.json().catch(()=>null);
-          if(data && data.ok){{
+          if(data && data.ok){
             alert("✅ Aktualisiert.");
-          }} else {{
+          } else {
             alert("❌ Fehler: " + ((data && data.error) ? data.error : ("HTTP " + res.status)));
-          }}
-        }}
+          }
+        }
       </script>
     </body>
     </html>
@@ -2189,6 +2270,11 @@ DQ_CARDS = [
     {"group": "Kontakte", "title": "Position", "description": "", "actions": [{"label": "Fehlende Daten", "href": "/dq/contacts/position/missing"}]},
     {"group": "Kontakte", "title": "LinkedIn-URL", "description": "", "actions": [{"label": "Fehlende Daten", "href": "/dq/contacts/linkedin/missing"}]},
 
+    {"group": "Kontakte", "title": "Zuordnung", "description": "", "actions": [
+        {"label": "Keine Organisation", "href": "/dq/contacts/org/missing"},
+        {"label": "E-Mail passt nicht zur Organisation", "href": "/dq/contacts/email/mismatch"},
+    ]},
+
     # Freelancer (Organisation = "Freelancer")
     {"group": "Freelancer", "title": "Vorname", "description": "Organisation = Freelancer", "actions": [{"label": "Fehlende Daten", "href": "/dq/freelancers/first_name/missing"}]},
     {"group": "Freelancer", "title": "Nachname", "description": "Organisation = Freelancer", "actions": [{"label": "Fehlende Daten", "href": "/dq/freelancers/last_name/missing"}]},
@@ -2205,6 +2291,7 @@ DQ_CARDS = [
     ]},
     {"group": "Organisationen", "title": "Adresse", "description": "", "actions": [{"label": "Fehlende Daten", "href": "/dq/orgs/missing?field=address"}]},
     {"group": "Organisationen", "title": "Website", "description": "", "actions": [{"label": "Fehlende Daten", "href": "/dq/orgs/missing?field=website"}]},
+    {"group": "Organisationen", "title": "Kontakte", "description": "", "actions": [{"label": "Keine Kontakte", "href": "/dq/orgs/no_contacts"}]},
 ]
 
 
@@ -2436,6 +2523,14 @@ async def db_fetch_person_detail(person_id: int) -> dict:
 
 
 
+async def db_delete_person_cache(person_id: int) -> None:
+    if not db_pool:
+        return
+    async with db_pool.acquire() as conn:
+        await conn.execute("DELETE FROM persons_cache WHERE id=$1", int(person_id))
+
+
+
 
 async def db_upsert_person_cache_partial(
     person_id: int,
@@ -2555,6 +2650,7 @@ async def _render_missing_list(
     after_id: int,
     limit: int,
     sql: str,
+    field_key: str,
     freelancer_mode: str = "exclude",
 ) -> HTMLResponse:
     """
@@ -2586,7 +2682,11 @@ async def _render_missing_list(
             <td style="width:120px;"><code class="badge">{pid}</code></td>
             <td>{html_escape(fn)}</td>
             <td>{html_escape(ln)}</td>
-            <td style="width:160px;"><a class="chip" href="/dq/contacts/person/{pid}">Öffnen</a></td>
+            <td style="width:340px;">
+              <a class="chip chip-primary" href="/dq/contacts/person/{pid}">Bearbeiten</a>
+              <a class="chip chip-link" target="_blank" rel="noopener" href="{pipedrive_person_url(pid)}">Pipedrive ↗</a>
+              <button class="chip chip-danger" onclick="deletePerson({pid})">🗑 Löschen</button>
+            </td>
           </tr>
         """)
 
@@ -2608,7 +2708,7 @@ async def _render_missing_list(
               <input id="chk_all_rows" type="checkbox" onchange="toggleAllRows('chk_all_rows')">
               Alle auswählen
             </label>
-            <button class="btn btn-outline" onclick="bulkExport('person')">Excel-Export</button>
+            <button class="btn btn-outline" onclick="bulkExport('person', '{field_key}')">Excel-Export</button>
           </div>
         </div>
         <div class="small" style="margin-top:8px; opacity:.9;">
@@ -2639,7 +2739,7 @@ async def _render_missing_list(
               <th style="width:120px;">ID</th>
               <th>Vorname</th>
               <th>Nachname</th>
-              <th style="width:160px;">Aktion</th>
+              <th style="width:340px;">Aktion</th>
             </tr>
           </thead>
           <tbody>
@@ -2715,7 +2815,7 @@ async def dq_first_name_missing_db(after_id: int = 0, limit: int = 200):
         return HTMLResponse("DB nicht initialisiert (DATABASE_URL fehlt)", status_code=500)
     limit = max(50, min(int(limit), 500))
     sql = _dq_missing_sql_for_column("first_name", freelancer_mode="exclude")
-    return await _render_missing_list("Vorname – Fehlende Daten", "/dq/contacts/first_name/missing", after_id, limit, sql, freelancer_mode="exclude")
+    return await _render_missing_list("Vorname – Fehlende Daten", "/dq/contacts/first_name/missing", after_id, limit, sql, field_key="first_name", freelancer_mode="exclude")
 
 
 @app.get("/dq/contacts/last_name/missing", response_class=HTMLResponse)
@@ -2726,7 +2826,7 @@ async def dq_last_name_missing_db(after_id: int = 0, limit: int = 200):
         return HTMLResponse("DB nicht initialisiert", status_code=500)
     limit = max(50, min(int(limit), 500))
     sql = _dq_missing_sql_for_column("last_name", freelancer_mode="exclude")
-    return await _render_missing_list("Nachname – Fehlende Daten", "/dq/contacts/last_name/missing", after_id, limit, sql, freelancer_mode="exclude")
+    return await _render_missing_list("Nachname – Fehlende Daten", "/dq/contacts/last_name/missing", after_id, limit, sql, field_key="last_name", freelancer_mode="exclude")
 
 
 @app.get("/dq/contacts/gender/missing", response_class=HTMLResponse)
@@ -2737,7 +2837,7 @@ async def dq_gender_missing_db(after_id: int = 0, limit: int = 200):
         return HTMLResponse("DB nicht initialisiert", status_code=500)
     limit = max(50, min(int(limit), 500))
     sql = _dq_missing_sql_for_column("gender", freelancer_mode="exclude")
-    return await _render_missing_list("Geschlecht – Fehlende Daten", "/dq/contacts/gender/missing", after_id, limit, sql, freelancer_mode="exclude")
+    return await _render_missing_list("Geschlecht – Fehlende Daten", "/dq/contacts/gender/missing", after_id, limit, sql, field_key="gender", freelancer_mode="exclude")
 
 
 @app.get("/dq/contacts/email/missing", response_class=HTMLResponse)
@@ -2748,7 +2848,7 @@ async def dq_email_missing_db(after_id: int = 0, limit: int = 200):
         return HTMLResponse("DB nicht initialisiert", status_code=500)
     limit = max(50, min(int(limit), 500))
     sql = _dq_missing_sql_for_column("email", freelancer_mode="exclude")
-    return await _render_missing_list("E-Mail – Fehlende Daten", "/dq/contacts/email/missing", after_id, limit, sql, freelancer_mode="exclude")
+    return await _render_missing_list("E-Mail – Fehlende Daten", "/dq/contacts/email/missing", after_id, limit, sql, field_key="email", freelancer_mode="exclude")
 
 
 @app.get("/dq/contacts/du_sie/missing", response_class=HTMLResponse)
@@ -2759,7 +2859,7 @@ async def dq_du_sie_missing_db(after_id: int = 0, limit: int = 200):
         return HTMLResponse("DB nicht initialisiert", status_code=500)
     limit = max(50, min(int(limit), 500))
     sql = _dq_missing_sql_for_column("du_sie", freelancer_mode="exclude")
-    return await _render_missing_list("Du oder Sie – Fehlende Daten", "/dq/contacts/du_sie/missing", after_id, limit, sql, freelancer_mode="exclude")
+    return await _render_missing_list("Du oder Sie – Fehlende Daten", "/dq/contacts/du_sie/missing", after_id, limit, sql, field_key="du_sie", freelancer_mode="exclude")
 
 
 @app.get("/dq/contacts/position/missing", response_class=HTMLResponse)
@@ -2770,7 +2870,7 @@ async def dq_position_missing_db(after_id: int = 0, limit: int = 200):
         return HTMLResponse("DB nicht initialisiert", status_code=500)
     limit = max(50, min(int(limit), 500))
     sql = _dq_missing_sql_for_column("position", freelancer_mode="exclude")
-    return await _render_missing_list("Position – Fehlende Daten", "/dq/contacts/position/missing", after_id, limit, sql, freelancer_mode="exclude")
+    return await _render_missing_list("Position – Fehlende Daten", "/dq/contacts/position/missing", after_id, limit, sql, field_key="position", freelancer_mode="exclude")
 
 
 @app.get("/dq/contacts/linkedin/missing", response_class=HTMLResponse)
@@ -2781,7 +2881,7 @@ async def dq_linkedin_missing_db(after_id: int = 0, limit: int = 200):
         return HTMLResponse("DB nicht initialisiert", status_code=500)
     limit = max(50, min(int(limit), 500))
     sql = _dq_missing_sql_for_column("linkedin_url", freelancer_mode="exclude")
-    return await _render_missing_list("LinkedIn-URL – Fehlende Daten", "/dq/contacts/linkedin/missing", after_id, limit, sql, freelancer_mode="exclude")
+    return await _render_missing_list("LinkedIn-URL – Fehlende Daten", "/dq/contacts/linkedin/missing", after_id, limit, sql, field_key="linkedin_url", freelancer_mode="exclude")
 
 ########################################################################
 #
@@ -2797,7 +2897,7 @@ async def dq_freelancers_first_name_missing(after_id: int = 0, limit: int = 200)
         return HTMLResponse("DB nicht initialisiert", status_code=500)
     limit = max(50, min(int(limit), 500))
     sql = _dq_missing_sql_for_column("first_name", freelancer_mode="only")
-    return await _render_missing_list("Freelancer – Vorname (fehlend)", "/dq/freelancers/first_name/missing", after_id, limit, sql, freelancer_mode="only")
+    return await _render_missing_list("Freelancer – Vorname (fehlend)", "/dq/freelancers/first_name/missing", after_id, limit, sql, field_key="first_name", freelancer_mode="only")
 
 
 @app.get("/dq/freelancers/last_name/missing", response_class=HTMLResponse)
@@ -2808,7 +2908,7 @@ async def dq_freelancers_last_name_missing(after_id: int = 0, limit: int = 200):
         return HTMLResponse("DB nicht initialisiert", status_code=500)
     limit = max(50, min(int(limit), 500))
     sql = _dq_missing_sql_for_column("last_name", freelancer_mode="only")
-    return await _render_missing_list("Freelancer – Nachname (fehlend)", "/dq/freelancers/last_name/missing", after_id, limit, sql, freelancer_mode="only")
+    return await _render_missing_list("Freelancer – Nachname (fehlend)", "/dq/freelancers/last_name/missing", after_id, limit, sql, field_key="last_name", freelancer_mode="only")
 
 
 @app.get("/dq/freelancers/gender/missing", response_class=HTMLResponse)
@@ -2819,7 +2919,7 @@ async def dq_freelancers_gender_missing(after_id: int = 0, limit: int = 200):
         return HTMLResponse("DB nicht initialisiert", status_code=500)
     limit = max(50, min(int(limit), 500))
     sql = _dq_missing_sql_for_column("gender", freelancer_mode="only")
-    return await _render_missing_list("Freelancer – Geschlecht (fehlend)", "/dq/freelancers/gender/missing", after_id, limit, sql, freelancer_mode="only")
+    return await _render_missing_list("Freelancer – Geschlecht (fehlend)", "/dq/freelancers/gender/missing", after_id, limit, sql, field_key="gender", freelancer_mode="only")
 
 
 @app.get("/dq/freelancers/email/missing", response_class=HTMLResponse)
@@ -2830,7 +2930,7 @@ async def dq_freelancers_email_missing(after_id: int = 0, limit: int = 200):
         return HTMLResponse("DB nicht initialisiert", status_code=500)
     limit = max(50, min(int(limit), 500))
     sql = _dq_missing_sql_for_column("email", freelancer_mode="only")
-    return await _render_missing_list("Freelancer – E-Mail (fehlend)", "/dq/freelancers/email/missing", after_id, limit, sql, freelancer_mode="only")
+    return await _render_missing_list("Freelancer – E-Mail (fehlend)", "/dq/freelancers/email/missing", after_id, limit, sql, field_key="email", freelancer_mode="only")
 
 
 @app.get("/dq/freelancers/du_sie/missing", response_class=HTMLResponse)
@@ -2841,7 +2941,7 @@ async def dq_freelancers_du_sie_missing(after_id: int = 0, limit: int = 200):
         return HTMLResponse("DB nicht initialisiert", status_code=500)
     limit = max(50, min(int(limit), 500))
     sql = _dq_missing_sql_for_column("du_sie", freelancer_mode="only")
-    return await _render_missing_list("Freelancer – Du/Sie (fehlend)", "/dq/freelancers/du_sie/missing", after_id, limit, sql, freelancer_mode="only")
+    return await _render_missing_list("Freelancer – Du/Sie (fehlend)", "/dq/freelancers/du_sie/missing", after_id, limit, sql, field_key="du_sie", freelancer_mode="only")
 
 
 @app.get("/dq/freelancers/position/missing", response_class=HTMLResponse)
@@ -2852,7 +2952,7 @@ async def dq_freelancers_position_missing(after_id: int = 0, limit: int = 200):
         return HTMLResponse("DB nicht initialisiert", status_code=500)
     limit = max(50, min(int(limit), 500))
     sql = _dq_missing_sql_for_column("position", freelancer_mode="only")
-    return await _render_missing_list("Freelancer – Position (fehlend)", "/dq/freelancers/position/missing", after_id, limit, sql, freelancer_mode="only")
+    return await _render_missing_list("Freelancer – Position (fehlend)", "/dq/freelancers/position/missing", after_id, limit, sql, field_key="position", freelancer_mode="only")
 
 
 @app.get("/dq/freelancers/linkedin/missing", response_class=HTMLResponse)
@@ -2863,7 +2963,7 @@ async def dq_freelancers_linkedin_missing(after_id: int = 0, limit: int = 200):
         return HTMLResponse("DB nicht initialisiert", status_code=500)
     limit = max(50, min(int(limit), 500))
     sql = _dq_missing_sql_for_column("linkedin_url", freelancer_mode="only")
-    return await _render_missing_list("Freelancer – LinkedIn (fehlend)", "/dq/freelancers/linkedin/missing", after_id, limit, sql, freelancer_mode="only")
+    return await _render_missing_list("Freelancer – LinkedIn (fehlend)", "/dq/freelancers/linkedin/missing", after_id, limit, sql, field_key="linkedin_url", freelancer_mode="only")
 
 ########################################################################
 #
@@ -2891,7 +2991,11 @@ async def dq_first_name_invalidchars(after_id: int = 0, limit: int = 200):
             <td><code class="badge">{pid}</code></td>
             <td>{html_escape(fn)}</td>
             <td>{html_escape(ln)}</td>
-            <td style="width:160px;"><a class="chip" href="/dq/contacts/person/{pid}">Öffnen</a></td>
+            <td style="width:340px;">
+              <a class="chip chip-primary" href="/dq/contacts/person/{pid}">Bearbeiten</a>
+              <a class="chip chip-link" target="_blank" rel="noopener" href="{pipedrive_person_url(pid)}">Pipedrive ↗</a>
+              <button class="chip chip-danger" onclick="deletePerson({pid})">🗑 Löschen</button>
+            </td>
           </tr>
         """)
 
@@ -2919,7 +3023,7 @@ async def dq_first_name_invalidchars(after_id: int = 0, limit: int = 200):
               <th style="width:120px;">ID</th>
               <th>Vorname</th>
               <th>Nachname</th>
-              <th style="width:160px;">Aktion</th>
+              <th style="width:340px;">Aktion</th>
             </tr>
           </thead>
           <tbody>
@@ -2951,7 +3055,11 @@ async def dq_last_name_invalidchars(after_id: int = 0, limit: int = 200):
             <td><code class="badge">{pid}</code></td>
             <td>{html_escape(fn)}</td>
             <td>{html_escape(ln)}</td>
-            <td style="width:160px;"><a class="chip" href="/dq/contacts/person/{pid}">Öffnen</a></td>
+            <td style="width:340px;">
+              <a class="chip chip-primary" href="/dq/contacts/person/{pid}">Bearbeiten</a>
+              <a class="chip chip-link" target="_blank" rel="noopener" href="{pipedrive_person_url(pid)}">Pipedrive ↗</a>
+              <button class="chip chip-danger" onclick="deletePerson({pid})">🗑 Löschen</button>
+            </td>
           </tr>
         """)
 
@@ -2978,7 +3086,7 @@ async def dq_last_name_invalidchars(after_id: int = 0, limit: int = 200):
               <th style="width:120px;">ID</th>
               <th>Vorname</th>
               <th>Nachname</th>
-              <th style="width:160px;">Aktion</th>
+              <th style="width:340px;">Aktion</th>
             </tr>
           </thead>
           <tbody>
@@ -3030,7 +3138,11 @@ async def dq_first_name_title(after_id: int = 0, limit: int = 200):
             <td><code class="badge">{pid}</code></td>
             <td>{html_escape(fn)}</td>
             <td>{html_escape(ln)}</td>
-            <td style="width:160px;"><a class="chip" href="/dq/contacts/person/{pid}">Öffnen</a></td>
+            <td style="width:340px;">
+              <a class="chip chip-primary" href="/dq/contacts/person/{pid}">Bearbeiten</a>
+              <a class="chip chip-link" target="_blank" rel="noopener" href="{pipedrive_person_url(pid)}">Pipedrive ↗</a>
+              <button class="chip chip-danger" onclick="deletePerson({pid})">🗑 Löschen</button>
+            </td>
           </tr>
         """)
 
@@ -3057,7 +3169,7 @@ async def dq_first_name_title(after_id: int = 0, limit: int = 200):
               <th style="width:120px;">ID</th>
               <th>Vorname</th>
               <th>Nachname</th>
-              <th style="width:160px;">Aktion</th>
+              <th style="width:340px;">Aktion</th>
             </tr>
           </thead>
           <tbody>
@@ -3137,7 +3249,10 @@ async def dq_person_detail(person_id: int, saved: int = 0):
           <div class="title">Kontakt bearbeiten</div>
           <div class="subtitle"><code class="badge">{person_id}</code> · Organisation: <b>{html_escape(p.get("org_name") or "-")}</b></div>
         </div>
-        <div style="display:flex; gap:10px;">
+        <div style="display:flex; gap:10px; flex-wrap:wrap; justify-content:flex-end;">
+          <a class="chip chip-link" target="_blank" rel="noopener" href="{pipedrive_person_url(person_id)}">Pipedrive ↗</a>
+          <a class="chip chip-link" target="_blank" rel="noopener" href="{pipedrive_org_url(int(org_id)) if org_id else "#"}">Organisation ↗</a>
+          <button class="chip chip-danger" onclick="deletePerson({person_id}, '/overview')">🗑 Löschen</button>
           <a class="btn btn-outline" href="/overview">Übersicht</a>
         </div>
       </div>
@@ -3199,6 +3314,25 @@ async def dq_person_detail(person_id: int, saved: int = 0):
     return HTMLResponse(page_shell("Kontakt bearbeiten", body))
 
 
+
+
+@app.post("/dq/contacts/person/{person_id}/delete")
+async def dq_person_delete(person_id: int):
+    if "default" not in user_tokens:
+        return JSONResponse({"ok": False, "error": "Nicht eingeloggt"}, status_code=401)
+
+    headers = get_headers()
+    if not headers:
+        return JSONResponse({"ok": False, "error": "Nicht eingeloggt"}, status_code=401)
+
+    try:
+        await pipedrive_delete_v2("persons", int(person_id), headers)
+        await db_delete_person_cache(int(person_id))
+        return JSONResponse({"ok": True})
+    except Exception as e:
+        return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
+
+
 @app.post("/dq/contacts/person/{person_id}/update")
 async def dq_person_update(person_id: int, payload: dict = Body(...)):
     if "default" not in user_tokens:
@@ -3238,6 +3372,377 @@ async def dq_person_update(person_id: int, payload: dict = Body(...)):
         return JSONResponse({"ok": True})
     except Exception as e:
         return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
+
+########################################################################
+#
+# Neue Bereiche
+#
+########################################################################
+
+def _extract_host_from_website(url: str) -> str:
+    s = (url or "").strip().lower()
+    if not s:
+        return ""
+    s = re.sub(r"^https?://", "", s)
+    s = re.sub(r"^www\.", "", s)
+    s = s.split("/")[0]
+    s = s.split("?")[0]
+    s = s.split("#")[0]
+    s = s.split(":")[0]
+    return s.strip()
+
+
+def _email_domain(email: str) -> str:
+    s = (email or "").strip().lower()
+    if "@" not in s:
+        return ""
+    return s.split("@", 1)[1].strip()
+
+
+def _org_name_tokens_for_domain(name: str) -> list[str]:
+    s = (name or "").lower()
+    # typische Rechtsformen entfernen (DE/EU/US grob)
+    s = re.sub(r"(gmbh|ag|kg|ohg|ug|se|ltd|limited|inc|inc\.|corp|corp\.|llc|plc|bv|sarl|sas|sa|oy|ab|aps|as)", " ", s)
+    s = re.sub(r"[^a-z0-9]+", " ", s)
+    toks = [t for t in s.split() if len(t) >= 4]
+    # dedupe, keep order
+    out = []
+    seen = set()
+    for t in toks:
+        if t not in seen:
+            seen.add(t)
+            out.append(t)
+    return out
+
+
+def _matches_domain(email_dom: str, website_host: str) -> bool:
+    if not email_dom or not website_host:
+        return False
+    if email_dom == website_host:
+        return True
+    if email_dom.endswith("." + website_host):
+        return True
+    if website_host.endswith("." + email_dom):
+        return True
+    return False
+
+
+def _matches_name(email_dom: str, org_name: str) -> bool:
+    if not email_dom or not org_name:
+        return False
+    toks = _org_name_tokens_for_domain(org_name)
+    if not toks:
+        return False
+    return any(t in email_dom for t in toks)
+
+
+async def _db_collect_email_mismatch_rows(after_id: int, limit: int, scan_batch: int = 2000, max_batches: int = 20) -> tuple[list[dict], int]:
+    """Heuristik-Scan: E-Mail-Domain passt nicht zur Website-Domain und/oder nicht zum Org-Namen."""
+    out: list[dict] = []
+    last_scanned = after_id
+
+    sql = """
+    SELECT p.id, p.first_name, p.last_name, p.email, p.org_id, COALESCE(o.name,'') AS org_name, COALESCE(o.website,'') AS org_website
+    FROM persons_cache p
+    LEFT JOIN orgs_cache o ON o.id = p.org_id
+    WHERE p.org_id IS NOT NULL
+      AND p.email IS NOT NULL
+      AND btrim(p.email) <> ''
+      AND p.id > $1
+    ORDER BY p.id
+    LIMIT $2
+    """
+
+    async with db_pool.acquire() as conn:
+        for _ in range(max_batches):
+            rows = await conn.fetch(sql, last_scanned, scan_batch)
+            if not rows:
+                break
+
+            for r in rows:
+                rid = int(r["id"])
+                last_scanned = rid
+
+                email = (r.get("email") or "").strip()
+                email_dom = _email_domain(email)
+                if not email_dom:
+                    continue
+
+                org_name = (r.get("org_name") or "").strip()
+                org_website = (r.get("org_website") or "").strip()
+                host = _extract_host_from_website(org_website)
+
+                domain_ok = True
+                name_ok = True
+
+                # Domain-Check nur, wenn Website vorhanden
+                if host:
+                    domain_ok = _matches_domain(email_dom, host)
+
+                # Name-Check nur, wenn Name vorhanden
+                if org_name:
+                    name_ok = _matches_name(email_dom, org_name)
+
+                if (host and not domain_ok) or (org_name and not name_ok):
+                    reason = []
+                    if host and not domain_ok:
+                        reason.append("domain")
+                    if org_name and not name_ok:
+                        reason.append("name")
+                    d = dict(r)
+                    d["reason"] = ",".join(reason) if reason else "mismatch"
+                    out.append(d)
+                    if len(out) >= limit:
+                        return out, last_scanned
+
+    return out, last_scanned
+
+
+@app.get("/dq/contacts/org/missing", response_class=HTMLResponse)
+async def dq_contacts_missing_org(after_id: int = 0, limit: int = 200):
+    if "default" not in user_tokens:
+        return RedirectResponse("/login")
+    if not db_pool:
+        return HTMLResponse("DB nicht initialisiert", status_code=500)
+
+    limit = max(50, min(int(limit), 500))
+    sql = """
+    SELECT id, first_name, last_name
+    FROM persons_cache
+    WHERE org_id IS NULL
+      AND id > $1
+    ORDER BY id
+    LIMIT $2
+    """
+
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch(sql, after_id, limit)
+
+    trs = []
+    last_id = after_id
+    for r in rows:
+        pid = int(r["id"])
+        last_id = pid
+        fn = (r["first_name"] or "").strip() or "-"
+        ln = (r["last_name"] or "").strip() or "-"
+        trs.append(f"""
+          <tr>
+            <td style="width:48px; text-align:center;"><input class="rowchk" type="checkbox" value="{pid}"></td>
+            <td style="width:120px;"><code class="badge">{pid}</code></td>
+            <td>{html_escape(fn)}</td>
+            <td>{html_escape(ln)}</td>
+            <td style="width:340px;">
+              <a class="chip chip-primary" href="/dq/contacts/person/{pid}">Bearbeiten</a>
+              <a class="chip chip-link" target="_blank" rel="noopener" href="{pipedrive_person_url(pid)}">Pipedrive ↗</a>
+              <button class="chip chip-danger" onclick="deletePerson({pid})">🗑 Löschen</button>
+            </td>
+          </tr>
+        """)
+
+    next_link = f'<a class="btn btn-outline" href="/dq/contacts/org/missing?after_id={last_id}&limit={limit}">Weiter →</a>' if rows else ""
+
+    bulk_panel = f"""
+      <div class="panel" style="margin-bottom:12px;">
+        <div style="display:flex; gap:10px; flex-wrap:wrap; align-items:center; justify-content:space-between;">
+          <div style="display:flex; gap:10px; flex-wrap:wrap; align-items:center;">
+            <label class="small" style="display:flex; align-items:center; gap:8px;">
+              <input id="chk_all_rows" type="checkbox" onchange="toggleAllRows('chk_all_rows')">
+              Alle auswählen
+            </label>
+            <button class="btn btn-outline" onclick="bulkExport('person', 'org_id')">Excel-Export</button>
+          </div>
+        </div>
+      </div>
+    """
+
+    body = f"""
+      <div class="topbar">
+        <div>
+          <div class="title">Kontakte – Keine Organisation</div>
+          <div class="subtitle">Kontakte ohne zugeordnete Organisation · Liste aus Cache-DB · Page size: {limit}</div>
+        </div>
+        <div style="display:flex; gap:10px;">{next_link}</div>
+      </div>
+
+      {bulk_panel}
+
+      <div class="panel">
+        <table>
+          <thead>
+            <tr>
+              <th style="width:48px; text-align:center;"><input id="chk_all_rows_header" type="checkbox" onchange="toggleAllRows('chk_all_rows_header')"></th>
+              <th style="width:120px;">ID</th>
+              <th>Vorname</th>
+              <th>Nachname</th>
+              <th style="width:340px;">Aktion</th>
+            </tr>
+          </thead>
+          <tbody>
+            {''.join(trs) if trs else '<tr><td colspan="5">✅ Keine Treffer.</td></tr>'}
+          </tbody>
+        </table>
+      </div>
+    """
+    return HTMLResponse(page_shell("Kontakte – Keine Organisation", body))
+
+
+@app.get("/dq/orgs/no_contacts", response_class=HTMLResponse)
+async def dq_orgs_no_contacts(after_id: int = 0, limit: int = 200):
+    if "default" not in user_tokens:
+        return RedirectResponse("/login")
+    if not db_pool:
+        return HTMLResponse("DB nicht initialisiert", status_code=500)
+
+    limit = max(50, min(int(limit), 500))
+
+    sql = """
+    SELECT o.id, o.name, o.website
+    FROM orgs_cache o
+    WHERE o.id > $1
+      AND NOT EXISTS (SELECT 1 FROM persons_cache p WHERE p.org_id = o.id)
+    ORDER BY o.id
+    LIMIT $2
+    """
+
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch(sql, after_id, limit)
+
+    trs = []
+    last_id = after_id
+    for r in rows:
+        oid = int(r["id"])
+        last_id = oid
+        name = (r["name"] or "").strip() or "-"
+        website = (r["website"] or "").strip() or "-"
+        trs.append(f"""
+          <tr>
+            <td style="width:120px;"><code class="badge">{oid}</code></td>
+            <td>{html_escape(name)}</td>
+            <td>{html_escape(website)}</td>
+            <td style="width:180px;">
+              <a class="chip chip-link" target="_blank" rel="noopener" href="{pipedrive_org_url(oid)}">Pipedrive ↗</a>
+            </td>
+          </tr>
+        """)
+
+    next_link = f'<a class="btn btn-outline" href="/dq/orgs/no_contacts?after_id={last_id}&limit={limit}">Weiter →</a>' if rows else ""
+
+    body = f"""
+      <div class="topbar">
+        <div>
+          <div class="title">Organisationen – Keine Kontakte</div>
+          <div class="subtitle">Organisationen ohne zugeordnete Kontakte · Liste aus Cache-DB · Page size: {limit}</div>
+        </div>
+        <div style="display:flex; gap:10px;">{next_link}</div>
+      </div>
+
+      <div class="panel">
+        <table>
+          <thead>
+            <tr>
+              <th style="width:120px;">ID</th>
+              <th>Name</th>
+              <th>Website</th>
+              <th style="width:180px;">Aktion</th>
+            </tr>
+          </thead>
+          <tbody>
+            {''.join(trs) if trs else '<tr><td colspan="4">✅ Keine Treffer.</td></tr>'}
+          </tbody>
+        </table>
+      </div>
+    """
+    return HTMLResponse(page_shell("Organisationen – Keine Kontakte", body))
+
+
+@app.get("/dq/contacts/email/mismatch", response_class=HTMLResponse)
+async def dq_contacts_email_mismatch(after_id: int = 0, limit: int = 200):
+    if "default" not in user_tokens:
+        return RedirectResponse("/login")
+    if not db_pool:
+        return HTMLResponse("DB nicht initialisiert", status_code=500)
+
+    limit = max(50, min(int(limit), 500))
+    rows, next_after = await _db_collect_email_mismatch_rows(after_id, limit)
+
+    trs = []
+    for r in rows:
+        pid = int(r["id"])
+        fn = (r.get("first_name") or "").strip() or "-"
+        ln = (r.get("last_name") or "").strip() or "-"
+        email = (r.get("email") or "").strip() or "-"
+        org_name = (r.get("org_name") or "").strip() or "-"
+        org_website = (r.get("org_website") or "").strip() or "-"
+        reason = (r.get("reason") or "").strip() or "mismatch"
+
+        trs.append(f"""
+          <tr>
+            <td style="width:48px; text-align:center;"><input class="rowchk" type="checkbox" value="{pid}"></td>
+            <td style="width:120px;"><code class="badge">{pid}</code></td>
+            <td>{html_escape(fn)}</td>
+            <td>{html_escape(ln)}</td>
+            <td>{html_escape(email)}</td>
+            <td>{html_escape(org_name)}<div class="small" style="opacity:.85">{html_escape(org_website)}</div></td>
+            <td style="width:120px;"><code class="badge">{html_escape(reason)}</code></td>
+            <td style="width:340px;">
+              <a class="chip chip-primary" href="/dq/contacts/person/{pid}">Bearbeiten</a>
+              <a class="chip chip-link" target="_blank" rel="noopener" href="{pipedrive_person_url(pid)}">Pipedrive ↗</a>
+              <button class="chip chip-danger" onclick="deletePerson({pid})">🗑 Löschen</button>
+            </td>
+          </tr>
+        """)
+
+    next_link = ""
+    if next_after and next_after > after_id:
+        next_link = f'<a class="btn btn-outline" href="/dq/contacts/email/mismatch?after_id={next_after}&limit={limit}">Weiter →</a>'
+
+    bulk_panel = f"""
+      <div class="panel" style="margin-bottom:12px;">
+        <div style="display:flex; gap:10px; flex-wrap:wrap; align-items:center; justify-content:space-between;">
+          <div style="display:flex; gap:10px; flex-wrap:wrap; align-items:center;">
+            <label class="small" style="display:flex; align-items:center; gap:8px;">
+              <input id="chk_all_rows" type="checkbox" onchange="toggleAllRows('chk_all_rows')">
+              Alle auswählen
+            </label>
+            <button class="btn btn-outline" onclick="bulkExport('person', 'email')">Excel-Export</button>
+          </div>
+        </div>
+      </div>
+    """
+
+    body = f"""
+      <div class="topbar">
+        <div>
+          <div class="title">Kontakte – E-Mail passt nicht zur Organisation</div>
+          <div class="subtitle">Heuristik: Domain passt nicht zur Website-Domain und/oder nicht zum Organisationsnamen · Liste aus Cache-DB · Page size: {limit}</div>
+        </div>
+        <div style="display:flex; gap:10px;">{next_link}</div>
+      </div>
+
+      {bulk_panel}
+
+      <div class="panel">
+        <table>
+          <thead>
+            <tr>
+              <th style="width:48px; text-align:center;"><input id="chk_all_rows_header" type="checkbox" onchange="toggleAllRows('chk_all_rows_header')"></th>
+              <th style="width:120px;">ID</th>
+              <th>Vorname</th>
+              <th>Nachname</th>
+              <th>E-Mail</th>
+              <th>Organisation</th>
+              <th style="width:120px;">Grund</th>
+              <th style="width:340px;">Aktion</th>
+            </tr>
+          </thead>
+          <tbody>
+            {''.join(trs) if trs else '<tr><td colspan="8">✅ Keine Treffer.</td></tr>'}
+          </tbody>
+        </table>
+      </div>
+    """
+    return HTMLResponse(page_shell("Kontakte – E-Mail passt nicht", body))
+
 
 ########################################################################
 #
