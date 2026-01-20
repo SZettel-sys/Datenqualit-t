@@ -2154,10 +2154,11 @@ def page_shell(title: str, body_html: str) -> str:
     <head>
       <meta charset="utf-8"/>
       <meta name="viewport" content="width=device-width, initial-scale=1"/>
-      <title>{{html_escape(title)}}</title>
-      <link rel="stylesheet" href="/static/app.css?v={{CSS_VERSION}}">
+      <title>{html_escape(title)}</title>
+      <link rel="stylesheet" href="/static/app.css?v={CSS_VERSION}">
       <style>
         .backbar{{display:flex; justify-content:flex-end; margin:10px 0 18px; gap:10px; flex-wrap:wrap;}}
+        .btn-inline{{padding:6px 12px; border-radius:12px;}}
         .chip{{display:inline-flex; align-items:center; gap:6px; padding:6px 10px; border-radius:999px;
               text-decoration:none; border:1px solid rgba(15,23,42,.14); background:#fff; font-size:13px;}}
         .chip:hover{{border-color: rgba(2,132,199,.35);}}
@@ -2165,85 +2166,80 @@ def page_shell(title: str, body_html: str) -> str:
         .chip-primary{{border-color: rgba(14,165,233,.35); color:#075985; background: rgba(14,165,233,.06);}}
         .chip-danger{{border-color: rgba(239,68,68,.35); color:#b91c1c; background: rgba(239,68,68,.06); cursor:pointer;}}
         .chip-danger:hover{{border-color: rgba(239,68,68,.6);}}
-        .btn-inline{{padding:6px 12px; border-radius:12px;}}
       </style>
     </head>
     <body>
-      {{logo_html}}
+      {logo_html}
       <div class="container">
         <div class="backbar">
           <button class="btn btn-outline btn-inline" onclick="goBack()">← Zurück</button>
           <a class="btn btn-outline btn-inline" href="/overview">Übersicht</a>
         </div>
-        {{body_html}}
+        {body_html}
       </div>
       <script>
-function goBack(){
-  if(window.history.length > 1) window.history.back();
-  else window.location.href = "/overview";
-}
-function _selectedIds(){
+function _selectedIds(){{
   const xs = Array.from(document.querySelectorAll("input.rowchk:checked"));
   return xs.map(x => x.value).join(",");
-}
-function bulkExport(entity, fieldKey){
+}}
+function bulkExport(entity, fieldKey){{
   const ids = _selectedIds();
-  if(!ids){
+  if(!ids){{
     alert("Bitte mindestens einen Datensatz auswählen.");
     return;
-  }
+  }}
   const fk = fieldKey ? ("&field_key=" + encodeURIComponent(fieldKey)) : "";
   window.location.href = "/dq/bulk/xlsx/selected?entity=" + encodeURIComponent(entity) + "&ids=" + encodeURIComponent(ids) + fk;
-}
-function toggleAllRows(masterId){
+}}
+function toggleAllRows(masterId){{
   const m = document.getElementById(masterId);
   const checked = m ? m.checked : false;
-  document.querySelectorAll("input.rowchk").forEach(x => { x.checked = checked; });
-}
+  document.querySelectorAll("input.rowchk").forEach(x => {{ x.checked = checked; }});
+}}
+function goBack(){{
+  if(window.history.length > 1) window.history.back();
+  else window.location.href = "/overview";
+}}
 
-async function deletePerson(id, redirectUrl){
-  if(!confirm("Kontakt wirklich in Pipedrive löschen?
-
-Hinweis: Das kann nicht rückgängig gemacht werden.")) return;
-  const res = await fetch(`/dq/contacts/person/${id}/delete`, {method:"POST"});
+async function deletePerson(id, redirectUrl){{
+  if(!confirm("Kontakt wirklich in Pipedrive löschen?\\n\\nHinweis: Das kann nicht rückgängig gemacht werden.")) return;
+  const res = await fetch(`/dq/contacts/person/${{id}}/delete`, {{method:"POST"}});
   const data = await res.json().catch(()=>null);
-  if(res.ok && data && data.ok){
+  if(res.ok && data && data.ok){{
     alert("✅ Kontakt gelöscht");
-    if(redirectUrl){ window.location.href = redirectUrl; }
-    else { location.reload(); }
-  } else {
+    if(redirectUrl){{ window.location.href = redirectUrl; }}
+    else {{ location.reload(); }}
+  }} else {{
     alert("❌ Fehler: " + ((data && data.error) ? data.error : ("HTTP " + res.status)));
-  }
-}
+  }}
+}}
 
-        async function updateField(entityType, id, fieldKey){
-          const inp = document.getElementById(`inp_${entityType}_${id}_${fieldKey}`);
-          const val = inp ? inp.value : "";
-          if(!confirm("Wirklich in Pipedrive aktualisieren?")) return;
+async function updateField(entityType, id, fieldKey){{
+  const inp = document.getElementById(`inp_${{entityType}}_${{id}}_${{fieldKey}}`);
+  const val = inp ? inp.value : "";
+  if(!confirm("Wirklich in Pipedrive aktualisieren?")) return;
 
-          const res = await fetch("/dq/update", {
-            method:"POST",
-            headers:{"Content-Type":"application/json"},
-            body: JSON.stringify({
-              entity_type: entityType,
-              entity_id: parseInt(id),
-              field_key: fieldKey,
-              value: val
-            })
-          });
-          const data = await res.json().catch(()=>null);
-          if(data && data.ok){
-            alert("✅ Aktualisiert.");
-          } else {
-            alert("❌ Fehler: " + ((data && data.error) ? data.error : ("HTTP " + res.status)));
-          }
-        }
+  const res = await fetch("/dq/update", {{
+    method:"POST",
+    headers:{{"Content-Type":"application/json"}},
+    body: JSON.stringify({{
+      entity_type: entityType,
+      entity_id: parseInt(id),
+      field_key: fieldKey,
+      value: val
+    }})
+  }});
+  const data = await res.json().catch(()=>null);
+  if(data && data.ok){{
+    alert("✅ Aktualisiert.");
+  }} else {{
+    alert("❌ Fehler: " + ((data && data.error) ? data.error : ("HTTP " + res.status)));
+  }}
+}}
       </script>
     </body>
     </html>
     """
-
-
 DQ_CARDS = [
     {
         "group": "Kontakte",
@@ -2269,6 +2265,11 @@ DQ_CARDS = [
     {"group": "Kontakte", "title": "Du oder Sie", "description": "", "actions": [{"label": "Fehlende Daten", "href": "/dq/contacts/du_sie/missing"}]},
     {"group": "Kontakte", "title": "Position", "description": "", "actions": [{"label": "Fehlende Daten", "href": "/dq/contacts/position/missing"}]},
     {"group": "Kontakte", "title": "LinkedIn-URL", "description": "", "actions": [{"label": "Fehlende Daten", "href": "/dq/contacts/linkedin/missing"}]},
+    {"group": "Kontakte", "title": "Organisation", "description": "", "actions": [{"label": "Keine Organisation", "href": "/dq/contacts/org/missing"}]},
+    {"group": "Kontakte", "title": "E-Mail vs Organisation", "description": "", "actions": [{"label": "E-Mail passt nicht zur Organisation", "href": "/dq/contacts/email/mismatch"}]},
+    {"group": "Kontakte", "title": "Organisation", "description": "", "actions": [{"label": "Keine Organisation", "href": "/dq/contacts/org/missing"}]},
+    {"group": "Kontakte", "title": "E-Mail vs Organisation", "description": "", "actions": [{"label": "E-Mail passt nicht zur Organisation", "href": "/dq/contacts/email/mismatch"}]},
+
 
     {"group": "Kontakte", "title": "Zuordnung", "description": "", "actions": [
         {"label": "Keine Organisation", "href": "/dq/contacts/org/missing"},
@@ -2291,7 +2292,7 @@ DQ_CARDS = [
     ]},
     {"group": "Organisationen", "title": "Adresse", "description": "", "actions": [{"label": "Fehlende Daten", "href": "/dq/orgs/missing?field=address"}]},
     {"group": "Organisationen", "title": "Website", "description": "", "actions": [{"label": "Fehlende Daten", "href": "/dq/orgs/missing?field=website"}]},
-    {"group": "Organisationen", "title": "Kontakte", "description": "", "actions": [{"label": "Keine Kontakte", "href": "/dq/orgs/no_contacts"}]},
+    {"group": "Organisationen", "title": "Kontakte", "description": "", "actions": [{"label": "Ohne Kontakte", "href": "/dq/orgs/no_contacts"}]},
 ]
 
 
