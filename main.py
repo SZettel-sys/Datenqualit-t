@@ -2149,99 +2149,110 @@ def page_shell(title: str, body_html: str) -> str:
     else:
         logo_html = '<header><div style="font-weight:900;letter-spacing:.2px">bizforward · Datenqualität</div></header>'
 
-    return f"""
-    <html>
+    html = """    <html>
     <head>
-      <meta charset=\"utf-8\"/>
-      <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"/>
-      <title>{html_escape(title)}</title>
-      <link rel=\"stylesheet\" href=\"/static/app.css?v={CSS_VERSION}\">
+      <meta charset="utf-8"/>
+      <meta name="viewport" content="width=device-width, initial-scale=1"/>
+      <title>__TITLE__</title>
+      <link rel="stylesheet" href="/static/app.css?v=__CSS_VERSION__">
       <style>
-        .backbar{{display:flex; justify-content:flex-end; margin:10px 0 18px; gap:10px; flex-wrap:wrap;}}
-        .chip{{display:inline-flex; align-items:center; gap:6px; padding:6px 10px; border-radius:999px;
-              text-decoration:none; border:1px solid rgba(15,23,42,.14); background:#fff; font-size:13px;}}
-        .chip:hover{{border-color: rgba(2,132,199,.35);}}
-        .chip-link{{border-color: rgba(2,132,199,.35); color:#075985;}}
-        .chip-primary{{border-color: rgba(14,165,233,.35); color:#075985; background: rgba(14,165,233,.06);}}
-        .chip-danger{{border-color: rgba(239,68,68,.35); color:#b91c1c; background: rgba(239,68,68,.06); cursor:pointer;}}
-        .chip-danger:hover{{border-color: rgba(239,68,68,.6);}}
-        .btn-inline{{padding:6px 12px; border-radius:12px;}}
-        .action-stack{{display:flex; flex-direction:column; gap:10px; align-items:flex-start;}}
-        .action-stack .chip{{min-width:120px; justify-content:center;}}
+        .backbar{display:flex; justify-content:flex-end; margin:10px 0 18px; gap:10px; flex-wrap:wrap;}
+        .chip{display:inline-flex; align-items:center; gap:6px; padding:6px 10px; border-radius:999px;
+              text-decoration:none; border:1px solid rgba(15,23,42,.14); background:#fff; font-size:13px;}
+        .chip:hover{border-color: rgba(2,132,199,.35);}
+        .chip-link{border-color: rgba(2,132,199,.35); color:#075985;}
+        .chip-primary{border-color: rgba(14,165,233,.35); color:#075985; background: rgba(14,165,233,.06);}
+        .chip-danger{border-color: rgba(239,68,68,.35); color:#b91c1c; background: rgba(239,68,68,.06); cursor:pointer;}
+        .chip-danger:hover{border-color: rgba(239,68,68,.6);}
+        .btn-inline{padding:6px 12px; border-radius:12px;}
+
+        /* Action buttons in tables */
+        .action-stack{display:flex; flex-direction:column; align-items:flex-end; gap:8px;}
+        .action-stack .chip{justify-content:center; min-width:120px;}
       </style>
     </head>
     <body>
-      {logo_html}
-      <div class=\"container\">
-        <div class=\"backbar\">
-          <button class=\"btn btn-outline btn-inline\" onclick=\"goBack()\">← Zurück</button>
-          <a class=\"btn btn-outline btn-inline\" href=\"/overview\">Übersicht</a>
+      __LOGO__
+      <div class="container">
+        <div class="backbar">
+          <button class="btn btn-outline btn-inline" onclick="goBack()">← Zurück</button>
+          <a class="btn btn-outline btn-inline" href="/overview">Übersicht</a>
         </div>
-        {body_html}
+        __BODY__
       </div>
       <script>
-function goBack(){{
+function goBack(){
   if(window.history.length > 1) window.history.back();
   else window.location.href = "/overview";
-}}
-function _selectedIds(){{
+}
+function _selectedIds(){
   const xs = Array.from(document.querySelectorAll("input.rowchk:checked"));
   return xs.map(x => x.value).join(",");
-}}
-function bulkExport(entity, fieldKey){{
+}
+function bulkExport(entity, fieldKey){
   const ids = _selectedIds();
-  if(!ids){{
+  if(!ids){
     alert("Bitte mindestens einen Datensatz auswählen.");
     return;
-  }}
+  }
   const fk = fieldKey ? ("&field_key=" + encodeURIComponent(fieldKey)) : "";
   window.location.href = "/dq/bulk/xlsx/selected?entity=" + encodeURIComponent(entity) + "&ids=" + encodeURIComponent(ids) + fk;
-}}
-function toggleAllRows(masterId){{
+}
+function toggleAllRows(masterId){
   const m = document.getElementById(masterId);
   const checked = m ? m.checked : false;
-  document.querySelectorAll("input.rowchk").forEach(x => {{ x.checked = checked; }});
-}}
+  document.querySelectorAll("input.rowchk").forEach(x => { x.checked = checked; });
+}
 
-async function deletePerson(id, redirectUrl){{
-  if(!confirm("Kontakt wirklich in Pipedrive löschen?\n\nHinweis: Das kann nicht rückgängig gemacht werden.")) return;
-  const res = await fetch(`/dq/contacts/person/${{id}}/delete`, {{method:"POST"}});
+async function deletePerson(id, redirectUrl){
+  if(!confirm("Kontakt wirklich in Pipedrive löschen?
+
+Hinweis: Das kann nicht rückgängig gemacht werden.")) return;
+  const res = await fetch(`/dq/contacts/person/${id}/delete`, {method:"POST"});
   const data = await res.json().catch(()=>null);
-  if(res.ok && data && data.ok){{
+  if(res.ok && data && data.ok){
     alert("✅ Kontakt gelöscht");
-    if(redirectUrl){{ window.location.href = redirectUrl; }}
-    else {{ location.reload(); }}
-  }} else {{
+    if(redirectUrl){ window.location.href = redirectUrl; }
+    else { location.reload(); }
+  } else {
     alert("❌ Fehler: " + ((data && data.error) ? data.error : ("HTTP " + res.status)));
-  }}
-}}
+  }
+}
 
-async function updateField(entityType, id, fieldKey){{
-  const inp = document.getElementById(`inp_${{entityType}}_${{id}}_${{fieldKey}}`);
+async function updateField(entityType, id, fieldKey){
+  const inp = document.getElementById(`inp_${entityType}_${id}_${fieldKey}`);
   const val = inp ? inp.value : "";
   if(!confirm("Wirklich in Pipedrive aktualisieren?")) return;
 
-  const res = await fetch("/dq/update", {{
+  const res = await fetch("/dq/update", {
     method:"POST",
-    headers:{{"Content-Type":"application/json"}},
-    body: JSON.stringify({{
+    headers:{"Content-Type":"application/json"},
+    body: JSON.stringify({
       entity_type: entityType,
       entity_id: parseInt(id),
       field_key: fieldKey,
       value: val
-    }})
-  }});
+    })
+  });
   const data = await res.json().catch(()=>null);
-  if(data && data.ok){{
+  if(data && data.ok){
     alert("✅ Aktualisiert.");
-  }} else {{
+  } else {
     alert("❌ Fehler: " + ((data && data.error) ? data.error : ("HTTP " + res.status)));
-  }}
-}}
+  }
+}
       </script>
     </body>
     </html>
     """
+
+    return (
+        html
+        .replace("__TITLE__", html_escape(title))
+        .replace("__CSS_VERSION__", str(CSS_VERSION))
+        .replace("__LOGO__", logo_html)
+        .replace("__BODY__", body_html)
+    )
 
 
 DQ_CARDS = [
@@ -2315,16 +2326,17 @@ def _render_cards(group: str, counts: dict[str, Optional[int]]) -> str:
         return f'<span style="margin-left:8px; padding:2px 8px; border-radius:999px; font-size:12px; background:rgba(2,132,199,.12); color:#075985;">{int(n)}</span>'
 
     card_html = []
-    used_hrefs: set[str] = set()
     for c in cards:
         actions_html = []
         total = 0
         has_any = False
 
+        seen_hrefs = set()
         for a in c.get("actions", []):
             href = a["href"]
-            if href in used_hrefs:
+            if href in seen_hrefs:
                 continue
+            seen_hrefs.add(href)
             n = counts.get(href)
             if isinstance(n, int):
                 total += n
@@ -2333,12 +2345,8 @@ def _render_cards(group: str, counts: dict[str, Optional[int]]) -> str:
             actions_html.append(
                 f'<a class="chip" href="{href}">{a["label"]}{_count_badge(n)}</a>'
             )
-            used_hrefs.add(href)
 
         total_badge = _count_badge(total) if has_any else ""
-        if not actions_html:
-            continue
-
         desc = c.get("description", "")
 
         card_html.append(f"""
@@ -2691,10 +2699,11 @@ async def _render_missing_list(
             <td>{html_escape(ln)}</td>
             <td style="width:340px;">
               <div class="action-stack">
-<a class="chip chip-primary" href="/dq/contacts/person/{pid}">Bearbeiten</a>
+              <a class="chip chip-primary" href="/dq/contacts/person/{pid}">Bearbeiten</a>
               <a class="chip chip-link" target="_blank" rel="noopener" href="{pipedrive_person_url(pid)}">Pipedrive ↗</a>
               <button class="chip chip-danger" onclick="deletePerson({pid})">🗑 Löschen</button>
-                          </div>
+            
+              </div>
             </td>
           </tr>
         """)
@@ -3002,10 +3011,11 @@ async def dq_first_name_invalidchars(after_id: int = 0, limit: int = 200):
             <td>{html_escape(ln)}</td>
             <td style="width:340px;">
               <div class="action-stack">
-<a class="chip chip-primary" href="/dq/contacts/person/{pid}">Bearbeiten</a>
+              <a class="chip chip-primary" href="/dq/contacts/person/{pid}">Bearbeiten</a>
               <a class="chip chip-link" target="_blank" rel="noopener" href="{pipedrive_person_url(pid)}">Pipedrive ↗</a>
               <button class="chip chip-danger" onclick="deletePerson({pid})">🗑 Löschen</button>
-                          </div>
+            
+              </div>
             </td>
           </tr>
         """)
@@ -3068,10 +3078,11 @@ async def dq_last_name_invalidchars(after_id: int = 0, limit: int = 200):
             <td>{html_escape(ln)}</td>
             <td style="width:340px;">
               <div class="action-stack">
-<a class="chip chip-primary" href="/dq/contacts/person/{pid}">Bearbeiten</a>
+              <a class="chip chip-primary" href="/dq/contacts/person/{pid}">Bearbeiten</a>
               <a class="chip chip-link" target="_blank" rel="noopener" href="{pipedrive_person_url(pid)}">Pipedrive ↗</a>
               <button class="chip chip-danger" onclick="deletePerson({pid})">🗑 Löschen</button>
-                          </div>
+            
+              </div>
             </td>
           </tr>
         """)
@@ -3153,10 +3164,11 @@ async def dq_first_name_title(after_id: int = 0, limit: int = 200):
             <td>{html_escape(ln)}</td>
             <td style="width:340px;">
               <div class="action-stack">
-<a class="chip chip-primary" href="/dq/contacts/person/{pid}">Bearbeiten</a>
+              <a class="chip chip-primary" href="/dq/contacts/person/{pid}">Bearbeiten</a>
               <a class="chip chip-link" target="_blank" rel="noopener" href="{pipedrive_person_url(pid)}">Pipedrive ↗</a>
               <button class="chip chip-danger" onclick="deletePerson({pid})">🗑 Löschen</button>
-                          </div>
+            
+              </div>
             </td>
           </tr>
         """)
@@ -3415,27 +3427,34 @@ def _email_domain(email: str) -> str:
 
 
 def _org_name_tokens_for_domain(name: str) -> list[str]:
+    """Tokens aus Organisationsname, die typischerweise in Domains vorkommen.
+
+    - entfernt Rechtsformen
+    - nimmt normale Tokens (>=4)
+    - nimmt zusaetzlich Akronyme (2-5 Zeichen, z.B. AXA, IBM, BMW)
+    """
     raw = (name or '').strip()
     if not raw:
         return []
 
-    # Kurze Akronyme (z.B. AXA, IBM, BMW) explizit behalten
-    acronyms = [m.lower() for m in re.findall(r'\b[A-Z0-9]{2,5}\b', raw)]
+    # Akronyme aus dem Original extrahieren (gross geschrieben)
+    acr = []
+    for t in re.findall(r'[A-Z0-9]{2,5}', raw):
+        tl = t.lower()
+        if tl not in acr:
+            acr.append(tl)
 
     s = raw.lower()
     # typische Rechtsformen entfernen (DE/EU/US grob)
-    s = re.sub(r'\b(gmbh|ag|kg|ohg|ug|se|ltd|limited|inc\.?|corp\.?|llc|plc|bv|sarl|sas|sa|oy|ab|aps|as)\b', ' ', s)
+    s = re.sub(r'(gmbh|ag|kg|ohg|ug|se|ltd|limited|inc|inc\.|corp|corp\.|llc|plc|bv|sarl|sas|sa|oy|ab|aps|as)', ' ', s)
     s = re.sub(r'[^a-z0-9]+', ' ', s)
 
     toks = [t for t in s.split() if len(t) >= 4]
-    # Falls nur kurze Tokens übrig bleiben (z.B. nur 'axa'), auf >=3 gehen
-    if not toks:
-        toks = [t for t in s.split() if len(t) >= 3]
+    # Akronyme hinzufuegen (falls nicht schon drin)
+    toks = acr + toks
 
-    toks = acronyms + toks
-
-    out: list[str] = []
-    seen: set[str] = set()
+    out = []
+    seen = set()
     for t in toks:
         if t and t not in seen:
             seen.add(t)
@@ -3443,15 +3462,59 @@ def _org_name_tokens_for_domain(name: str) -> list[str]:
     return out
 
 
+def _domain_root(host: str) -> str:
+    """Heuristik fuer 'root domain' ohne Public Suffix List.
+
+    Ziel: www.foo.bar -> foo.bar ; foo.co.uk -> foo.co.uk
+    """
+    h = (host or '').strip().lower()
+    if not h:
+        return ''
+    h = re.sub(r'^www\.', '', h)
+    parts = [p for p in h.split('.') if p]
+    if len(parts) < 2:
+        return h
+
+    # ccTLD-Heuristik: wenn letzte Komponente 2 Zeichen und davor 'co|com|org|net|gov|ac'
+    cc = parts[-1]
+    sld = parts[-2]
+    if len(cc) == 2 and sld in {'co','com','org','net','gov','ac'} and len(parts) >= 3:
+        return '.'.join(parts[-3:])
+    return '.'.join(parts[-2:])
+
+
+def _domain_sld(root: str) -> str:
+    r = (root or '').strip().lower()
+    if not r or '.' not in r:
+        return r
+    return r.rsplit('.', 1)[0]
+
+
 def _matches_domain(email_dom: str, website_host: str) -> bool:
     if not email_dom or not website_host:
         return False
-    if email_dom == website_host:
+
+    ed = email_dom.strip().lower()
+    wh = website_host.strip().lower()
+
+    # exakte / Subdomain Matches
+    if ed == wh:
         return True
-    if email_dom.endswith("." + website_host):
+    if ed.endswith('.' + wh) or wh.endswith('.' + ed):
         return True
-    if website_host.endswith("." + email_dom):
+
+    # Root-Domain vergleichen (z.B. a.b.com -> b.com)
+    ed_root = _domain_root(ed)
+    wh_root = _domain_root(wh)
+    if ed_root and wh_root and ed_root == wh_root:
         return True
+
+    # TLD-Varianten tolerieren (slv.de vs slv.com / ... .net vs .de)
+    ed_sld = _domain_sld(ed_root)
+    wh_sld = _domain_sld(wh_root)
+    if ed_sld and wh_sld and ed_sld == wh_sld and len(ed_sld) >= 3:
+        return True
+
     return False
 
 
@@ -3461,7 +3524,8 @@ def _matches_name(email_dom: str, org_name: str) -> bool:
     toks = _org_name_tokens_for_domain(org_name)
     if not toks:
         return False
-    return any(t in email_dom for t in toks)
+    ed = email_dom.strip().lower()
+    return any(t in ed for t in toks)
 
 
 async def _db_collect_email_mismatch_rows(after_id: int, limit: int, scan_batch: int = 2000, max_batches: int = 20) -> tuple[list[dict], int]:
@@ -3508,12 +3572,8 @@ async def _db_collect_email_mismatch_rows(after_id: int, limit: int, scan_batch:
                     domain_ok = _matches_domain(email_dom, host)
 
                 # Name-Check nur, wenn Name vorhanden
-                # Wenn die Domain bereits zur Website passt, ist der Name-Check oft zu streng (Akronyme etc.).
                 if org_name:
-                    if host and domain_ok:
-                        name_ok = True
-                    else:
-                        name_ok = _matches_name(email_dom, org_name)
+                    name_ok = _matches_name(email_dom, org_name)
 
                 if (host and not domain_ok) or (org_name and not name_ok):
                     reason = []
@@ -3565,10 +3625,11 @@ async def dq_contacts_missing_org(after_id: int = 0, limit: int = 200):
             <td>{html_escape(ln)}</td>
             <td style="width:340px;">
               <div class="action-stack">
-<a class="chip chip-primary" href="/dq/contacts/person/{pid}">Bearbeiten</a>
+              <a class="chip chip-primary" href="/dq/contacts/person/{pid}">Bearbeiten</a>
               <a class="chip chip-link" target="_blank" rel="noopener" href="{pipedrive_person_url(pid)}">Pipedrive ↗</a>
               <button class="chip chip-danger" onclick="deletePerson({pid})">🗑 Löschen</button>
-                          </div>
+            
+              </div>
             </td>
           </tr>
         """)
@@ -3720,10 +3781,11 @@ async def dq_contacts_email_mismatch(after_id: int = 0, limit: int = 200):
             <td style="width:120px;"><code class="badge">{html_escape(reason)}</code></td>
             <td style="width:340px;">
               <div class="action-stack">
-<a class="chip chip-primary" href="/dq/contacts/person/{pid}">Bearbeiten</a>
+              <a class="chip chip-primary" href="/dq/contacts/person/{pid}">Bearbeiten</a>
               <a class="chip chip-link" target="_blank" rel="noopener" href="{pipedrive_person_url(pid)}">Pipedrive ↗</a>
               <button class="chip chip-danger" onclick="deletePerson({pid})">🗑 Löschen</button>
-                          </div>
+            
+              </div>
             </td>
           </tr>
         """)
