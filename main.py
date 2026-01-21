@@ -2149,7 +2149,8 @@ def page_shell(title: str, body_html: str) -> str:
     else:
         logo_html = '<header><div style="font-weight:900;letter-spacing:.2px">bizforward · Datenqualität</div></header>'
 
-    html = """    <html>
+    html = """
+    <html>
     <head>
       <meta charset="utf-8"/>
       <meta name="viewport" content="width=device-width, initial-scale=1"/>
@@ -2165,94 +2166,92 @@ def page_shell(title: str, body_html: str) -> str:
         .chip-danger{border-color: rgba(239,68,68,.35); color:#b91c1c; background: rgba(239,68,68,.06); cursor:pointer;}
         .chip-danger:hover{border-color: rgba(239,68,68,.6);}
         .btn-inline{padding:6px 12px; border-radius:12px;}
-
-        /* Action buttons in tables */
-        .action-stack{display:flex; flex-direction:column; align-items:flex-end; gap:8px;}
-        .action-stack .chip{justify-content:center; min-width:120px;}
+        .action-stack{display:flex; flex-direction:column; gap:8px; align-items:flex-end;}
+        .action-stack .chip, .action-stack .btn{min-width: 132px; justify-content:center;}
       </style>
     </head>
     <body>
-      __LOGO__
+      __LOGO_HTML__
       <div class="container">
         <div class="backbar">
           <button class="btn btn-outline btn-inline" onclick="goBack()">← Zurück</button>
           <a class="btn btn-outline btn-inline" href="/overview">Übersicht</a>
         </div>
-        __BODY__
+        __BODY_HTML__
       </div>
       <script>
-function goBack(){
-  if(window.history.length > 1) window.history.back();
-  else window.location.href = "/overview";
-}
-function _selectedIds(){
-  const xs = Array.from(document.querySelectorAll("input.rowchk:checked"));
-  return xs.map(x => x.value).join(",");
-}
-function bulkExport(entity, fieldKey){
-  const ids = _selectedIds();
-  if(!ids){
-    alert("Bitte mindestens einen Datensatz auswählen.");
-    return;
-  }
-  const fk = fieldKey ? ("&field_key=" + encodeURIComponent(fieldKey)) : "";
-  window.location.href = "/dq/bulk/xlsx/selected?entity=" + encodeURIComponent(entity) + "&ids=" + encodeURIComponent(ids) + fk;
-}
-function toggleAllRows(masterId){
-  const m = document.getElementById(masterId);
-  const checked = m ? m.checked : false;
-  document.querySelectorAll("input.rowchk").forEach(x => { x.checked = checked; });
-}
+        function goBack(){
+          if(window.history.length > 1) window.history.back();
+          else window.location.href = "/overview";
+        }
 
-async function deletePerson(id, redirectUrl){
-  if(!confirm("Kontakt wirklich in Pipedrive löschen?
+        function _selectedIds(){
+          const xs = Array.from(document.querySelectorAll("input.rowchk:checked"));
+          return xs.map(x => x.value).join(",");
+        }
 
-Hinweis: Das kann nicht rückgängig gemacht werden.")) return;
-  const res = await fetch(`/dq/contacts/person/${id}/delete`, {method:"POST"});
-  const data = await res.json().catch(()=>null);
-  if(res.ok && data && data.ok){
-    alert("✅ Kontakt gelöscht");
-    if(redirectUrl){ window.location.href = redirectUrl; }
-    else { location.reload(); }
-  } else {
-    alert("❌ Fehler: " + ((data && data.error) ? data.error : ("HTTP " + res.status)));
-  }
-}
+        function bulkExport(entity, fieldKey){
+          const ids = _selectedIds();
+          if(!ids){
+            alert("Bitte mindestens einen Datensatz auswählen.");
+            return;
+          }
+          const fk = fieldKey ? ("&field_key=" + encodeURIComponent(fieldKey)) : "";
+          window.location.href = "/dq/bulk/xlsx/selected?entity=" + encodeURIComponent(entity) +
+                                 "&ids=" + encodeURIComponent(ids) + fk;
+        }
 
-async function updateField(entityType, id, fieldKey){
-  const inp = document.getElementById(`inp_${entityType}_${id}_${fieldKey}`);
-  const val = inp ? inp.value : "";
-  if(!confirm("Wirklich in Pipedrive aktualisieren?")) return;
+        function toggleAllRows(masterId){
+          const m = document.getElementById(masterId);
+          const checked = m ? m.checked : false;
+          document.querySelectorAll("input.rowchk").forEach(x => { x.checked = checked; });
+        }
 
-  const res = await fetch("/dq/update", {
-    method:"POST",
-    headers:{"Content-Type":"application/json"},
-    body: JSON.stringify({
-      entity_type: entityType,
-      entity_id: parseInt(id),
-      field_key: fieldKey,
-      value: val
-    })
-  });
-  const data = await res.json().catch(()=>null);
-  if(data && data.ok){
-    alert("✅ Aktualisiert.");
-  } else {
-    alert("❌ Fehler: " + ((data && data.error) ? data.error : ("HTTP " + res.status)));
-  }
-}
+        async function deletePerson(id, redirectUrl){
+          if(!confirm("Kontakt wirklich in Pipedrive löschen?\n\nHinweis: Das kann nicht rückgängig gemacht werden.")) return;
+          const res = await fetch(`/dq/contacts/person/${id}/delete`, {method:"POST"});
+          const data = await res.json().catch(()=>null);
+          if(res.ok && data && data.ok){
+            alert("✅ Kontakt gelöscht");
+            if(redirectUrl){ window.location.href = redirectUrl; }
+            else { location.reload(); }
+          } else {
+            alert("❌ Fehler: " + ((data && data.error) ? data.error : ("HTTP " + res.status)));
+          }
+        }
+
+        async function updateField(entityType, id, fieldKey){
+          const inp = document.getElementById(`inp_${entityType}_${id}_${fieldKey}`);
+          const val = inp ? inp.value : "";
+          if(!confirm("Wirklich in Pipedrive aktualisieren?")) return;
+
+          const res = await fetch("/dq/update", {
+            method:"POST",
+            headers:{"Content-Type":"application/json"},
+            body: JSON.stringify({
+              entity_type: entityType,
+              entity_id: parseInt(id),
+              field_key: fieldKey,
+              value: val
+            })
+          });
+          const data = await res.json().catch(()=>null);
+          if(data && data.ok){
+            alert("✅ Aktualisiert.");
+          } else {
+            alert("❌ Fehler: " + ((data && data.error) ? data.error : ("HTTP " + res.status)));
+          }
+        }
       </script>
     </body>
     </html>
     """
 
-    return (
-        html
-        .replace("__TITLE__", html_escape(title))
-        .replace("__CSS_VERSION__", str(CSS_VERSION))
-        .replace("__LOGO__", logo_html)
-        .replace("__BODY__", body_html)
-    )
+    return (html
+            .replace("__TITLE__", html_escape(title))
+            .replace("__CSS_VERSION__", str(CSS_VERSION))
+            .replace("__LOGO_HTML__", logo_html)
+            .replace("__BODY_HTML__", body_html))
 
 
 DQ_CARDS = [
@@ -2331,12 +2330,8 @@ def _render_cards(group: str, counts: dict[str, Optional[int]]) -> str:
         total = 0
         has_any = False
 
-        seen_hrefs = set()
         for a in c.get("actions", []):
             href = a["href"]
-            if href in seen_hrefs:
-                continue
-            seen_hrefs.add(href)
             n = counts.get(href)
             if isinstance(n, int):
                 total += n
@@ -2698,12 +2693,9 @@ async def _render_missing_list(
             <td>{html_escape(fn)}</td>
             <td>{html_escape(ln)}</td>
             <td style="width:340px;">
-              <div class="action-stack">
               <a class="chip chip-primary" href="/dq/contacts/person/{pid}">Bearbeiten</a>
               <a class="chip chip-link" target="_blank" rel="noopener" href="{pipedrive_person_url(pid)}">Pipedrive ↗</a>
               <button class="chip chip-danger" onclick="deletePerson({pid})">🗑 Löschen</button>
-            
-              </div>
             </td>
           </tr>
         """)
@@ -3010,12 +3002,9 @@ async def dq_first_name_invalidchars(after_id: int = 0, limit: int = 200):
             <td>{html_escape(fn)}</td>
             <td>{html_escape(ln)}</td>
             <td style="width:340px;">
-              <div class="action-stack">
               <a class="chip chip-primary" href="/dq/contacts/person/{pid}">Bearbeiten</a>
               <a class="chip chip-link" target="_blank" rel="noopener" href="{pipedrive_person_url(pid)}">Pipedrive ↗</a>
               <button class="chip chip-danger" onclick="deletePerson({pid})">🗑 Löschen</button>
-            
-              </div>
             </td>
           </tr>
         """)
@@ -3077,12 +3066,9 @@ async def dq_last_name_invalidchars(after_id: int = 0, limit: int = 200):
             <td>{html_escape(fn)}</td>
             <td>{html_escape(ln)}</td>
             <td style="width:340px;">
-              <div class="action-stack">
               <a class="chip chip-primary" href="/dq/contacts/person/{pid}">Bearbeiten</a>
               <a class="chip chip-link" target="_blank" rel="noopener" href="{pipedrive_person_url(pid)}">Pipedrive ↗</a>
               <button class="chip chip-danger" onclick="deletePerson({pid})">🗑 Löschen</button>
-            
-              </div>
             </td>
           </tr>
         """)
@@ -3163,12 +3149,9 @@ async def dq_first_name_title(after_id: int = 0, limit: int = 200):
             <td>{html_escape(fn)}</td>
             <td>{html_escape(ln)}</td>
             <td style="width:340px;">
-              <div class="action-stack">
               <a class="chip chip-primary" href="/dq/contacts/person/{pid}">Bearbeiten</a>
               <a class="chip chip-link" target="_blank" rel="noopener" href="{pipedrive_person_url(pid)}">Pipedrive ↗</a>
               <button class="chip chip-danger" onclick="deletePerson({pid})">🗑 Löschen</button>
-            
-              </div>
             </td>
           </tr>
         """)
@@ -3430,42 +3413,46 @@ def _org_name_tokens_for_domain(name: str) -> list[str]:
     """Tokens aus Organisationsname, die typischerweise in Domains vorkommen.
 
     - entfernt Rechtsformen
-    - nimmt normale Tokens (>=4)
-    - nimmt zusaetzlich Akronyme (2-5 Zeichen, z.B. AXA, IBM, BMW)
+    - extrahiert normale Tokens (>=4 Zeichen)
+    - nimmt zusätzlich Akronyme (2-5 Buchstaben) mit (z.B. AXA, IT, NRW)
     """
-    raw = (name or '').strip()
-    if not raw:
-        return []
-
-    # Akronyme aus dem Original extrahieren (gross geschrieben)
-    acr = []
-    for t in re.findall(r'[A-Z0-9]{2,5}', raw):
-        tl = t.lower()
-        if tl not in acr:
-            acr.append(tl)
-
+    raw = (name or "").strip()
     s = raw.lower()
+
     # typische Rechtsformen entfernen (DE/EU/US grob)
-    s = re.sub(r'(gmbh|ag|kg|ohg|ug|se|ltd|limited|inc|inc\.|corp|corp\.|llc|plc|bv|sarl|sas|sa|oy|ab|aps|as)', ' ', s)
-    s = re.sub(r'[^a-z0-9]+', ' ', s)
+    s = re.sub(r"(gmbh|ag|kg|ohg|ug|se|ltd|limited|inc\.?|corp\.?|llc|plc|bv|sarl|sas|sa|oy|ab|aps|as)", " ", s)
 
+    # Akronyme aus dem Original (vor lowercasing) ziehen
+    acr = re.findall(r"[A-ZÄÖÜ]{2,5}", raw)
+    acr = [a.lower() for a in acr]
+
+    # Normalisieren zu Domain-ähnlichen Tokens
+    s = re.sub(r"[^a-z0-9]+", " ", s)
     toks = [t for t in s.split() if len(t) >= 4]
-    # Akronyme hinzufuegen (falls nicht schon drin)
-    toks = acr + toks
 
-    out = []
-    seen = set()
+    # Akronyme hinzufügen (aber keine 2-Buchstaben-Wörter wie 'SE' als Rechtsform-Noise)
+    for a in acr:
+        if 2 <= len(a) <= 5 and a not in toks:
+            toks.append(a)
+
+    # dedupe, keep order
+    out: list[str] = []
+    seen: set[str] = set()
     for t in toks:
-        if t and t not in seen:
+        if t not in seen:
             seen.add(t)
             out.append(t)
     return out
 
 
+
 def _domain_root(host: str) -> str:
     """Heuristik fuer 'root domain' ohne Public Suffix List.
 
-    Ziel: www.foo.bar -> foo.bar ; foo.co.uk -> foo.co.uk
+    Beispiele:
+      - www.foo.bar -> foo.bar
+      - foo.co.uk   -> foo.co.uk
+      - vtours.com.br -> vtours.com.br
     """
     h = (host or '').strip().lower()
     if not h:
@@ -3475,27 +3462,51 @@ def _domain_root(host: str) -> str:
     if len(parts) < 2:
         return h
 
-    # ccTLD-Heuristik: wenn letzte Komponente 2 Zeichen und davor 'co|com|org|net|gov|ac'
     cc = parts[-1]
     sld = parts[-2]
+    # ccTLD-Heuristik (co.uk, com.br, ...)
     if len(cc) == 2 and sld in {'co','com','org','net','gov','ac'} and len(parts) >= 3:
         return '.'.join(parts[-3:])
     return '.'.join(parts[-2:])
 
 
 def _domain_sld(root: str) -> str:
+    """Registrable Label (Stamm) zur Root-Domain.
+
+    Beispiele:
+      - vertbaudet.de -> vertbaudet
+      - vtours.com.br -> vtours
+      - foo.co.uk -> foo
+      - it.nrw -> it
+    """
     r = (root or '').strip().lower()
     if not r or '.' not in r:
         return r
-    return r.rsplit('.', 1)[0]
+    parts = [p for p in r.split('.') if p]
+    if len(parts) < 2:
+        return r
+    cc = parts[-1]
+    sld = parts[-2]
+    if len(cc) == 2 and sld in {'co','com','org','net','gov','ac'} and len(parts) >= 3:
+        return parts[-3]
+    return parts[-2]
 
 
 def _matches_domain(email_dom: str, website_host: str) -> bool:
+    """True, wenn Email-Domain zur Website-Domain passt.
+
+    - exakte / Subdomain Matches (inkl. www.-Variante)
+    - Root-Domain Match
+    - TLD-Varianten Match (z.B. vtours.de vs vtours.com.br)
+    """
     if not email_dom or not website_host:
         return False
 
-    ed = email_dom.strip().lower()
-    wh = website_host.strip().lower()
+    ed = (email_dom or '').strip().lower()
+    wh = (website_host or '').strip().lower()
+
+    if not ed or not wh:
+        return False
 
     # exakte / Subdomain Matches
     if ed == wh:
@@ -3509,13 +3520,14 @@ def _matches_domain(email_dom: str, website_host: str) -> bool:
     if ed_root and wh_root and ed_root == wh_root:
         return True
 
-    # TLD-Varianten tolerieren (slv.de vs slv.com / ... .net vs .de)
+    # TLD-Varianten tolerieren: gleicher Stamm (SLD) reicht
     ed_sld = _domain_sld(ed_root)
     wh_sld = _domain_sld(wh_root)
-    if ed_sld and wh_sld and ed_sld == wh_sld and len(ed_sld) >= 3:
+    if ed_sld and wh_sld and ed_sld == wh_sld and len(ed_sld) >= 2:
         return True
 
     return False
+
 
 
 def _matches_name(email_dom: str, org_name: str) -> bool:
@@ -3524,8 +3536,9 @@ def _matches_name(email_dom: str, org_name: str) -> bool:
     toks = _org_name_tokens_for_domain(org_name)
     if not toks:
         return False
-    ed = email_dom.strip().lower()
+    ed = (email_dom or "").strip().lower()
     return any(t in ed for t in toks)
+
 
 
 async def _db_collect_email_mismatch_rows(after_id: int, limit: int, scan_batch: int = 2000, max_batches: int = 20) -> tuple[list[dict], int]:
@@ -3624,12 +3637,9 @@ async def dq_contacts_missing_org(after_id: int = 0, limit: int = 200):
             <td>{html_escape(fn)}</td>
             <td>{html_escape(ln)}</td>
             <td style="width:340px;">
-              <div class="action-stack">
               <a class="chip chip-primary" href="/dq/contacts/person/{pid}">Bearbeiten</a>
               <a class="chip chip-link" target="_blank" rel="noopener" href="{pipedrive_person_url(pid)}">Pipedrive ↗</a>
               <button class="chip chip-danger" onclick="deletePerson({pid})">🗑 Löschen</button>
-            
-              </div>
             </td>
           </tr>
         """)
@@ -3780,12 +3790,9 @@ async def dq_contacts_email_mismatch(after_id: int = 0, limit: int = 200):
             <td>{html_escape(org_name)}<div class="small" style="opacity:.85">{html_escape(org_website)}</div></td>
             <td style="width:120px;"><code class="badge">{html_escape(reason)}</code></td>
             <td style="width:340px;">
-              <div class="action-stack">
               <a class="chip chip-primary" href="/dq/contacts/person/{pid}">Bearbeiten</a>
               <a class="chip chip-link" target="_blank" rel="noopener" href="{pipedrive_person_url(pid)}">Pipedrive ↗</a>
               <button class="chip chip-danger" onclick="deletePerson({pid})">🗑 Löschen</button>
-            
-              </div>
             </td>
           </tr>
         """)
