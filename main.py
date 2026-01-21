@@ -2174,13 +2174,15 @@ def page_shell(title: str, body_html: str) -> str:
       __LOGO_HTML__
       <div class="container">
         <div class="backbar">
-          <button class="btn btn-outline btn-inline" onclick="goBack()">← Zurück</button>
+          <button type="button" class="btn btn-outline btn-inline" onclick="goBack(event)">← Zurück</button>
           <a class="btn btn-outline btn-inline" href="/overview">Übersicht</a>
         </div>
         __BODY_HTML__
       </div>
       <script>
-        function goBack(){
+        function goBack(ev){
+          if(ev){ try{ ev.preventDefault(); }catch(e){} }
+
           if(window.history.length > 1) window.history.back();
           else window.location.href = "/overview";
         }
@@ -3256,7 +3258,7 @@ async def dq_person_detail(person_id: int, saved: int = 0):
     body = f"""
       <div class="topbar">
         <div>
-          <div class="title">Kontakt bearbeiten</div>
+          <h1 class="title" style="margin:0;">Kontakt bearbeiten</h1>
           <div class="subtitle"><code class="badge">{person_id}</code> · Organisation: <b>{html_escape(p.get("org_name") or "-")}</b></div>
         </div>
         <div style="display:flex; gap:10px; flex-wrap:wrap; justify-content:flex-end;">
@@ -3389,6 +3391,111 @@ async def dq_person_update(person_id: int, payload: dict = Body(...)):
 #
 ########################################################################
 
+
+
+########################################################################
+#
+# Organisation Detail + Update
+#
+########################################################################
+
+@app.get("/dq/orgs/org/{org_id}", response_class=HTMLResponse)
+async def dq_org_detail(org_id: int, saved: int = 0):
+    if "default" not in user_tokens:
+        return RedirectResponse("/login")
+    if not db_pool:
+        return HTMLResponse("DB nicht initialisiert (DATABASE_URL fehlt)", status_code=500)
+
+    org_map = await db_fetch_orgs_bulk([int(org_id)])
+    o = org_map.get(int(org_id)) or {}
+
+    def val(k: str) -> str:
+        return html_escape((o.get(k) or "").strip())
+
+    notice = ""
+    if saved:
+        notice = '<div class="panel" style="border-color: rgba(34,197,94,.35); background: rgba(34,197,94,.06);">✅ Gespeichert.</div>'
+
+    body = f"""
+      <div class="topbar">
+        <div>
+          <div class="title">Organisation bearbeiten</div>
+          <div class="subtitle"><code class="badge">{org_id}</code></div>
+        </div>
+        <div style="display:flex; gap:10px; flex-wrap:wrap; justify-content:flex-end;">
+          <a class="chip chip-link" target="_blank" rel="noopener" href="{pipedrive_org_url(int(org_id))}">Pipedrive ↗</a>
+          <a class="btn btn-outline" href="/overview">Übersicht</a>
+        </div>
+      </div>
+
+      {notice}
+
+      <div class="panel">
+        <table>
+          <tbody>
+            <tr><th style="width:240px;">Name</th><td><input class="field-input" id="name" value="{val("name")}" /></td></tr>
+            <tr><th>Adresse</th><td><input class="field-input" id="address" value="{val("address")}" /></td></tr>
+            <tr><th>Website</th><td><input class="field-input" id="website" value="{val("website")}" /></td></tr>
+          </tbody>
+        </table>
+        <div style="display:flex; gap:10px; margin-top:14px;">
+          <button type="button" class="btn btn-primary" onclick="saveOrg({org_id})">Speichern</button>
+        </div>
+      </div>
+
+      <script>
+        async function saveOrg(orgId) {{
+          const payload = {{
+            name: document.getElementById("name").value || "",
+            address: document.getElementById("address").value || "",
+            website: document.getElementById("website").value || ""
+          }};
+
+          const res = await fetch(`/dq/orgs/org/${{orgId}}/update`, {{
+            method:"POST",
+            headers:{{"Content-Type":"application/json"}},
+            body: JSON.stringify(payload)
+          }});
+          const data = await res.json().catch(()=>null);
+          if(res.ok && data && data.ok) {{
+            window.location.href = `/dq/orgs/org/${{orgId}}?saved=1`;
+          }} else {{
+            alert("❌ Fehler: " + ((data && data.error) ? data.error : ("HTTP " + res.status)));
+          }}
+        }}
+      </script>
+    """
+    return HTMLResponse(page_shell("Organisation bearbeiten", body))
+
+
+@app.post("/dq/orgs/org/{org_id}/update")
+async def dq_org_update(org_id: int, payload: dict = Body(...)):
+    if "default" not in user_tokens:
+        return JSONResponse({"ok": False, "error": "Nicht eingeloggt"}, status_code=401)
+
+    headers = get_headers()
+    if not headers:
+        return JSONResponse({"ok": False, "error": "Nicht eingeloggt"}, status_code=401)
+
+    name = (payload.get("name") or "").strip()
+    address = (payload.get("address") or "").strip()
+    website = (payload.get("website") or "").strip()
+
+    data = {
+        "name": name,
+        "address": address,
+        "website": website,
+    }
+
+    try:
+        await pipedrive_patch_v2("organizations", int(org_id), data, headers)
+        await db_upsert_org_cache_partial(int(org_id), name=name, address=address, website=website)
+    except Exception as e:
+        return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
+
+    return JSONResponse({"ok": True})
+
+
 def _extract_host_from_website(url: str) -> str:
     s = (url or "").strip().lower()
     if not s:
@@ -3491,6 +3598,42 @@ def _domain_sld(root: str) -> str:
     return parts[-2]
 
 
+def _edit_distance_leq1(a: str, b: str) -> bool:
+    """Sehr schnelle 'Levenshtein <= 1' Prüfung (für Domain-Stämme).
+    Erlaubt 0 oder 1 Edit (Insertion/Deletion/Substitution).
+    """
+    a = (a or "").strip().lower()
+    b = (b or "").strip().lower()
+    if a == b:
+        return True
+    la, lb = len(a), len(b)
+    if abs(la - lb) > 1:
+        return False
+
+    i = j = 0
+    edits = 0
+    while i < la and j < lb:
+        if a[i] == b[j]:
+            i += 1
+            j += 1
+            continue
+        edits += 1
+        if edits > 1:
+            return False
+        if la == lb:
+            i += 1
+            j += 1
+        elif la > lb:
+            i += 1
+        else:
+            j += 1
+
+    if i < la or j < lb:
+        edits += 1
+    return edits <= 1
+
+
+
 def _matches_domain(email_dom: str, website_host: str) -> bool:
     """True, wenn Email-Domain zur Website-Domain passt.
 
@@ -3522,8 +3665,12 @@ def _matches_domain(email_dom: str, website_host: str) -> bool:
     # TLD-Varianten tolerieren: gleicher Stamm (SLD) reicht
     ed_sld = _domain_sld(ed_root)
     wh_sld = _domain_sld(wh_root)
-    if ed_sld and wh_sld and ed_sld == wh_sld and len(ed_sld) >= 2:
-        return True
+    if ed_sld and wh_sld:
+        if ed_sld == wh_sld and len(ed_sld) >= 2:
+            return True
+        # sehr kleine Tippfehler tolerieren (z.B. verbaudet vs vertbaudet)
+        if min(len(ed_sld), len(wh_sld)) >= 6 and _edit_distance_leq1(ed_sld, wh_sld):
+            return True
 
     return False
 
@@ -3724,7 +3871,10 @@ async def dq_orgs_no_contacts(after_id: int = 0, limit: int = 200):
             <td>{html_escape(name)}</td>
             <td>{html_escape(website)}</td>
             <td style="width:180px;">
-              <a class="chip chip-link" target="_blank" rel="noopener" href="{pipedrive_org_url(oid)}">Pipedrive ↗</a>
+              <div class="action-stack">
+                <a class="chip chip-primary" href="/dq/orgs/org/{oid}">Bearbeiten</a>
+                <a class="chip chip-link" target="_blank" rel="noopener" href="{pipedrive_org_url(oid)}">Pipedrive ↗</a>
+              </div>
             </td>
           </tr>
         """)
@@ -3892,7 +4042,11 @@ async def dq_orgs_missing(field: str, after_id: int = 0, limit: int = 200):
               <div class="small">Aktueller Wert (editierbar)</div>
             </td>
             <td>
-              <button class="btn btn-primary" onclick="updateField('organization','{oid}','{field}')">Aktualisieren</button>
+              <div class="action-stack">
+                <button type="button" class="btn btn-primary" onclick="updateField('organization','{oid}','{field}')">Aktualisieren</button>
+                <a class="chip chip-primary" href="/dq/orgs/org/{oid}">Bearbeiten</a>
+                <a class="chip chip-link" target="_blank" rel="noopener" href="{pipedrive_org_url(oid)}">Pipedrive ↗</a>
+              </div>
             </td>
           </tr>
         """)
@@ -3990,7 +4144,11 @@ async def dq_orgs_invalidchars(field: str, after_id: int = 0, limit: int = 200):
               <div class="small">Aktueller Wert (editierbar)</div>
             </td>
             <td>
-              <button class="btn btn-primary" onclick="updateField('organization','{oid}','name')">Aktualisieren</button>
+              <div class="action-stack">
+                <button type="button" class="btn btn-primary" onclick="updateField('organization','{oid}','name')">Aktualisieren</button>
+                <a class="chip chip-primary" href="/dq/orgs/org/{oid}">Bearbeiten</a>
+                <a class="chip chip-link" target="_blank" rel="noopener" href="{pipedrive_org_url(oid)}">Pipedrive ↗</a>
+              </div>
             </td>
           </tr>
         """)
