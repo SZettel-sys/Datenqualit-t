@@ -3412,15 +3412,17 @@ def _email_domain(email: str) -> str:
 def _org_name_tokens_for_domain(name: str) -> list[str]:
     """Tokens aus Organisationsname, die typischerweise in Domains vorkommen.
 
-    - entfernt Rechtsformen
+    - entfernt gängige Rechtsformen
     - extrahiert normale Tokens (>=4 Zeichen)
-    - nimmt zusätzlich Akronyme (2-5 Buchstaben) mit (z.B. AXA, IT, NRW)
+    - nimmt zusätzlich Akronyme (2–5 Buchstaben) mit (z.B. AXA, VWFS, IT, NRW)
     """
     raw = (name or "").strip()
+    if not raw:
+        return []
     s = raw.lower()
 
     # typische Rechtsformen entfernen (DE/EU/US grob)
-    s = re.sub(r"(gmbh|ag|kg|ohg|ug|se|ltd|limited|inc\.?|corp\.?|llc|plc|bv|sarl|sas|sa|oy|ab|aps|as)", " ", s)
+    s = re.sub(r"(gmbh|ag|kg|ohg|ug|se|ltd|limited|inc\.?|corp\.?|llc|plc|bv|sarl|sas|sa|oy|ab|aps|as)", " ", s, flags=re.IGNORECASE)
 
     # Akronyme aus dem Original (vor lowercasing) ziehen
     acr = re.findall(r"[A-ZÄÖÜ]{2,5}", raw)
@@ -3430,7 +3432,7 @@ def _org_name_tokens_for_domain(name: str) -> list[str]:
     s = re.sub(r"[^a-z0-9]+", " ", s)
     toks = [t for t in s.split() if len(t) >= 4]
 
-    # Akronyme hinzufügen (aber keine 2-Buchstaben-Wörter wie 'SE' als Rechtsform-Noise)
+    # Akronyme hinzufügen
     for a in acr:
         if 2 <= len(a) <= 5 and a not in toks:
             toks.append(a)
@@ -3443,9 +3445,6 @@ def _org_name_tokens_for_domain(name: str) -> list[str]:
             seen.add(t)
             out.append(t)
     return out
-
-
-
 def _domain_root(host: str) -> str:
     """Heuristik fuer 'root domain' ohne Public Suffix List.
 
@@ -3588,7 +3587,7 @@ async def _db_collect_email_mismatch_rows(after_id: int, limit: int, scan_batch:
                 if org_name:
                     name_ok = _matches_name(email_dom, org_name)
 
-                if (host and not domain_ok) or (org_name and not name_ok):
+                if (host and (not domain_ok) and (not name_ok)) or ((not host) and org_name and (not name_ok)):
                     reason = []
                     if host and not domain_ok:
                         reason.append("domain")
