@@ -2348,13 +2348,13 @@ DQ_CARDS = [
     ]},
 
     # Freelancer (Organisation = "Freelancer")
-    {"group": "Freelancer", "title": "Vorname", "description": "Organisation = Freelancer", "actions": [{"label": "Fehlende Daten", "href": "/dq/freelancers/first_name/missing"}]},
-    {"group": "Freelancer", "title": "Nachname", "description": "Organisation = Freelancer", "actions": [{"label": "Fehlende Daten", "href": "/dq/freelancers/last_name/missing"}]},
-    {"group": "Freelancer", "title": "Geschlecht", "description": "Organisation = Freelancer", "actions": [{"label": "Fehlende Daten", "href": "/dq/freelancers/gender/missing"}]},
-    {"group": "Freelancer", "title": "E-Mail-Adresse", "description": "Organisation = Freelancer", "actions": [{"label": "Fehlende Daten", "href": "/dq/freelancers/email/missing"}]},
-    {"group": "Freelancer", "title": "Du oder Sie", "description": "Organisation = Freelancer", "actions": [{"label": "Fehlende Daten", "href": "/dq/freelancers/du_sie/missing"}]},
-    {"group": "Freelancer", "title": "Position", "description": "Organisation = Freelancer", "actions": [{"label": "Fehlende Daten", "href": "/dq/freelancers/position/missing"}]},
-    {"group": "Freelancer", "title": "LinkedIn-URL", "description": "Organisation = Freelancer", "actions": [{"label": "Fehlende Daten", "href": "/dq/freelancers/linkedin/missing"}]},
+    {"group": "Freelancer", "title": "Vorname", "description": "", "actions": [{"label": "Fehlende Daten", "href": "/dq/freelancers/first_name/missing"}]},
+    {"group": "Freelancer", "title": "Nachname", "description": "", "actions": [{"label": "Fehlende Daten", "href": "/dq/freelancers/last_name/missing"}]},
+    {"group": "Freelancer", "title": "Geschlecht", "description": "", "actions": [{"label": "Fehlende Daten", "href": "/dq/freelancers/gender/missing"}]},
+    {"group": "Freelancer", "title": "E-Mail-Adresse", "description": "", "actions": [{"label": "Fehlende Daten", "href": "/dq/freelancers/email/missing"}]},
+    {"group": "Freelancer", "title": "Du oder Sie", "description": "", "actions": [{"label": "Fehlende Daten", "href": "/dq/freelancers/du_sie/missing"}]},
+    {"group": "Freelancer", "title": "Position", "description": "", "actions": [{"label": "Fehlende Daten", "href": "/dq/freelancers/position/missing"}]},
+    {"group": "Freelancer", "title": "LinkedIn-URL", "description": "", "actions": [{"label": "Fehlende Daten", "href": "/dq/freelancers/linkedin/missing"}]},
 
     # Orgs
     {"group": "Organisationen", "title": "Name / Rechtsform", "description": "", "actions": [
@@ -2398,8 +2398,6 @@ def _render_cards(group: str, counts: dict[str, Optional[int]]) -> str:
             if href in seen_hrefs:
                 continue
             seen_hrefs.add(href)
-            if href in seen_hrefs:
-                continue
 
             n = counts.get(href)
             if isinstance(n, int):
@@ -3096,7 +3094,7 @@ async def dq_first_name_invalidchars(after_id: int = 0, limit: int = 200):
       <div class="topbar">
         <div>
           <div class="title">Vorname – Ungültige Zeichen</div>
-          <div class="subtitle">Kontakte (ohne Freelancer) · Liste aus Cache-DB · Page size: {limit}</div>
+          <div class="subtitle">Kontakte (ohne Freelancer) </div>
           <div class="subtitle"><span class="small">Erlaubt: Buchstaben inkl. Akzente, Leerzeichen, Bindestrich, Punkt, Apostroph. Nicht erlaubt: Emojis, Zahlen, Steuerzeichen.</span></div>
         </div>
         <div style="display:flex; gap:10px;">
@@ -3165,7 +3163,7 @@ async def dq_last_name_invalidchars(after_id: int = 0, limit: int = 200):
       <div class="topbar">
         <div>
           <div class="title">Nachname – Ungültige Zeichen</div>
-          <div class="subtitle">Kontakte (ohne Freelancer) · Liste aus Cache-DB · Page size: {limit}</div>
+          <div class="subtitle">Kontakte (ohne Freelancer) </div>
         </div>
         <div style="display:flex; gap:10px;">
           <a class="btn btn-outline" href="/overview">← Zur Übersicht</a>
@@ -3957,7 +3955,7 @@ async def dq_contacts_missing_org(after_id: int = 0, limit: int = 200):
       <div class="topbar">
         <div>
           <div class="title">Kontakte – Keine Organisation</div>
-          <div class="subtitle">Kontakte ohne zugeordnete Organisation · Liste aus Cache-DB · Page size: {limit}</div>
+          <div class="subtitle">Kontakte ohne zugeordnete Organisation </div>
         </div>
         <div style="display:flex; gap:10px;">{next_link}</div>
       </div>
@@ -4035,7 +4033,7 @@ async def dq_orgs_no_contacts(after_id: int = 0, limit: int = 200):
       <div class="topbar">
         <div>
           <div class="title">Organisationen – Keine Kontakte</div>
-          <div class="subtitle">Organisationen ohne zugeordnete Kontakte · Liste aus Cache-DB · Page size: {limit}</div>
+          <div class="subtitle">Organisationen ohne zugeordnete Kontakte </div>
         </div>
         <div style="display:flex; gap:10px;">{next_link}</div>
       </div>
@@ -4123,7 +4121,7 @@ async def dq_contacts_email_mismatch(after_id: int = 0, limit: int = 200):
       <div class="topbar">
         <div>
           <div class="title">Kontakte – E-Mail passt nicht zur Organisation</div>
-          <div class="subtitle">Heuristik: Domain passt nicht zur Website-Domain und/oder nicht zum Organisationsnamen · Liste aus Cache-DB · Page size: {limit}</div>
+          <div class="subtitle">Heuristik: Domain passt nicht zur Website-Domain und/oder nicht zum Organisationsnamen </div>
         </div>
         <div style="display:flex; gap:10px;">{next_link}</div>
       </div>
@@ -4216,7 +4214,7 @@ async def dq_orgs_missing(field: str, after_id: int = 0, limit: int = 200):
       <div class="topbar">
         <div>
           <div class="title">Organisationen – Fehlende Daten</div>
-          <div class="subtitle">Feld: {html_escape(field)} · Liste aus Cache-DB · Page size: {limit}</div>
+          <div class="subtitle">Feld: {html_escape(field)} </div>
         </div>
         <div style="display:flex; gap:10px;">
           <a class="btn btn-outline" href="/overview">← Zur Übersicht</a>
@@ -4318,7 +4316,7 @@ async def dq_orgs_invalidchars(field: str, after_id: int = 0, limit: int = 200):
       <div class="topbar">
         <div>
           <div class="title">Organisationen – Ungültige Zeichen</div>
-          <div class="subtitle">Feld: name · Liste aus Cache-DB · Page size: {limit}</div>
+          <div class="subtitle">Feld: name </div>
         </div>
         <div style="display:flex; gap:10px;">
           <a class="btn btn-outline" href="/overview">← Zur Übersicht</a>
