@@ -4,6 +4,7 @@ import json
 import csv
 import io
 import uuid
+import urllib.parse
 import httpx
 import time
 import time
@@ -1150,6 +1151,15 @@ async def dq_bulk_xlsx_preview(entity: str = Form(...), xlsx_file: UploadFile = 
     else:
         col_order = ["id", "name", "address", "website"]
 
+    # Back-Link für Detailseiten (Pagination + Filter erhalten)
+    qs = []
+    if after_id:
+        qs.append(f"after_id={after_id}")
+    if limit:
+        qs.append(f"limit={limit}")
+    current_url = base_path + (("?" + "&".join(qs)) if qs else "")
+    back_q = urllib.parse.quote(current_url, safe="")
+
     trs = []
     for r in preview_rows[:500]:
         ok = bool(r.get("_ok"))
@@ -2143,7 +2153,7 @@ async def get_person_field_options(headers: dict, field_key: str) -> list[tuple[
 #
 ########################################################################
 
-def page_shell(title: str, body_html: str) -> str:
+def page_shell(title: str, body_html: str, back_href: str = "/overview") -> str:
     logo_html = ""
     if os.path.isfile("static/bizforward-Logo-Clean-2024.svg"):
         logo_html = '<header><img src="/static/bizforward-Logo-Clean-2024.svg" alt="Logo"></header>'
@@ -2183,7 +2193,7 @@ def page_shell(title: str, body_html: str) -> str:
         .action-menu .menu{display:none; position:absolute; right:0; top:calc(100% + 6px); min-width:180px;
                            background:#fff; border:1px solid rgba(15,23,42,.12); border-radius:14px;
                            box-shadow:0 12px 30px rgba(2,6,23,.14); padding:6px; z-index:60;}
-        .action-menu.open .menu{display:block;}
+        .action-menu[open] .menu{display:block;}
         .menu-item{display:flex; align-items:center; justify-content:flex-start; gap:8px;
                    width:100%; padding:10px 10px; border-radius:12px;
                    text-decoration:none; border:none; background:transparent; cursor:pointer; color:inherit; font-size:14px;}
@@ -2199,29 +2209,12 @@ def page_shell(title: str, body_html: str) -> str:
       __LOGO_HTML__
       <div class="container">
         <div class="backbar">
-          <button type="button" class="btn btn-outline btn-inline" onclick="return goBack(event)">← Zurück</button>
+          <a class="btn btn-outline btn-inline" href="__BACK_HREF__">← Zurück</a>
           <a class="btn btn-outline btn-inline" href="/overview">Übersicht</a>
         </div>
         __BODY_HTML__
       </div>
       <script>
-        function goBack(ev){
-          if(ev){ try{ ev.preventDefault(); }catch(e){} }
-          // Reliable fallback even when history is empty/new tab:
-          const ref = document.referrer || "";
-          try{
-            if(ref){
-              const u = new URL(ref);
-              if(u.origin === window.location.origin){
-                window.location.href = ref;
-                return false;
-              }
-            }
-          }catch(e){}
-          // As last resort go to overview
-          window.location.href = "/overview";
-          return false;
-        }
 
         function _selectedIds(){
           const xs = Array.from(document.querySelectorAll("input.rowchk:checked"));
@@ -2313,7 +2306,8 @@ def page_shell(title: str, body_html: str) -> str:
             .replace("__TITLE__", html_escape(title))
             .replace("__CSS_VERSION__", str(CSS_VERSION))
             .replace("__LOGO_HTML__", logo_html)
-            .replace("__BODY_HTML__", body_html))
+            .replace("__BODY_HTML__", body_html)
+            .replace("__BACK_HREF__", html_escape(back_href)))
 
 
 DQ_CARDS = [
@@ -2760,15 +2754,15 @@ async def _render_missing_list(
             <td>{html_escape(fn)}</td>
             <td>{html_escape(ln)}</td>
             <td style="width:340px;">
-              <div class="action-menu">
-                <button type="button" class="chip chip-primary action-btn" onclick="toggleActionMenu(this)">⋯ Aktionen</button>
-                <div class="menu" role="menu">
-                  <a class="menu-item" href="/dq/contacts/person/{pid}">Bearbeiten</a>
+              <details class="action-menu">
+                 <summary class="chip chip-primary action-btn">⋯ Aktionen</summary>
+                 <div class="menu" role="menu">
+                  <a class="menu-item" href="/dq/contacts/person/{pid}?back={back_q}">Bearbeiten</a>
                   <a class="menu-item" target="_blank" rel="noopener" href="{pipedrive_person_url(pid)}">Pipedrive ↗</a>
                   <button type="button" class="menu-item menu-danger" onclick="deletePerson({pid})">🗑 Löschen</button>
                 </div>
-              </div>
-            </td>
+               </details>
+             </td>
           </tr>
         """)
 
@@ -3074,15 +3068,15 @@ async def dq_first_name_invalidchars(after_id: int = 0, limit: int = 200):
             <td>{html_escape(fn)}</td>
             <td>{html_escape(ln)}</td>
             <td style="width:340px;">
-              <div class="action-menu">
-                <button type="button" class="chip chip-primary action-btn" onclick="toggleActionMenu(this)">⋯ Aktionen</button>
-                <div class="menu" role="menu">
+              <details class="action-menu">
+                 <summary class="chip chip-primary action-btn">⋯ Aktionen</summary>
+                 <div class="menu" role="menu">
                   <a class="menu-item" href="/dq/contacts/person/{pid}">Bearbeiten</a>
                   <a class="menu-item" target="_blank" rel="noopener" href="{pipedrive_person_url(pid)}">Pipedrive ↗</a>
                   <button type="button" class="menu-item menu-danger" onclick="deletePerson({pid})">🗑 Löschen</button>
                 </div>
-              </div>
-            </td>
+               </details>
+             </td>
           </tr>
         """)
 
@@ -3143,15 +3137,15 @@ async def dq_last_name_invalidchars(after_id: int = 0, limit: int = 200):
             <td>{html_escape(fn)}</td>
             <td>{html_escape(ln)}</td>
             <td style="width:340px;">
-              <div class="action-menu">
-                <button type="button" class="chip chip-primary action-btn" onclick="toggleActionMenu(this)">⋯ Aktionen</button>
-                <div class="menu" role="menu">
+              <details class="action-menu">
+                 <summary class="chip chip-primary action-btn">⋯ Aktionen</summary>
+                 <div class="menu" role="menu">
                   <a class="menu-item" href="/dq/contacts/person/{pid}">Bearbeiten</a>
                   <a class="menu-item" target="_blank" rel="noopener" href="{pipedrive_person_url(pid)}">Pipedrive ↗</a>
                   <button type="button" class="menu-item menu-danger" onclick="deletePerson({pid})">🗑 Löschen</button>
                 </div>
-              </div>
-            </td>
+               </details>
+             </td>
           </tr>
         """)
 
@@ -3231,15 +3225,15 @@ async def dq_first_name_title(after_id: int = 0, limit: int = 200):
             <td>{html_escape(fn)}</td>
             <td>{html_escape(ln)}</td>
             <td style="width:340px;">
-              <div class="action-menu">
-                <button type="button" class="chip chip-primary action-btn" onclick="toggleActionMenu(this)">⋯ Aktionen</button>
-                <div class="menu" role="menu">
+              <details class="action-menu">
+                 <summary class="chip chip-primary action-btn">⋯ Aktionen</summary>
+                 <div class="menu" role="menu">
                   <a class="menu-item" href="/dq/contacts/person/{pid}">Bearbeiten</a>
                   <a class="menu-item" target="_blank" rel="noopener" href="{pipedrive_person_url(pid)}">Pipedrive ↗</a>
                   <button type="button" class="menu-item menu-danger" onclick="deletePerson({pid})">🗑 Löschen</button>
                 </div>
-              </div>
-            </td>
+               </details>
+             </td>
           </tr>
         """)
 
@@ -3284,7 +3278,7 @@ async def dq_first_name_title(after_id: int = 0, limit: int = 200):
 ########################################################################
 
 @app.get("/dq/contacts/person/{person_id}", response_class=HTMLResponse)
-async def dq_person_detail(person_id: int, saved: int = 0):
+async def dq_person_detail(person_id: int, saved: int = 0, back: str = ""):
     if "default" not in user_tokens:
         return RedirectResponse("/login")
     if not db_pool:
@@ -3408,7 +3402,8 @@ async def dq_person_detail(person_id: int, saved: int = 0):
         }}
       </script>
     """
-    return HTMLResponse(page_shell("Kontakt bearbeiten", body))
+    back_href = back if (back and isinstance(back,str) and back.startswith("/")) else "/overview"
+    return HTMLResponse(page_shell("Kontakt bearbeiten", body, back_href=back_href))
 
 
 
@@ -3485,7 +3480,7 @@ async def dq_person_update(person_id: int, payload: dict = Body(...)):
 ########################################################################
 
 @app.get("/dq/orgs/org/{org_id}", response_class=HTMLResponse)
-async def dq_org_detail(org_id: int, saved: int = 0):
+async def dq_org_detail(org_id: int, saved: int = 0, back: str = ""):
     if "default" not in user_tokens:
         return RedirectResponse("/login")
     if not db_pool:
@@ -3550,7 +3545,8 @@ async def dq_org_detail(org_id: int, saved: int = 0):
         }}
       </script>
     """
-    return HTMLResponse(page_shell("Organisation bearbeiten", body))
+    back_href = back if (back and isinstance(back,str) and back.startswith("/")) else "/overview"
+    return HTMLResponse(page_shell("Organisation bearbeiten", body, back_href=back_href))
 
 
 @app.post("/dq/orgs/org/{org_id}/update")
@@ -3923,15 +3919,15 @@ async def dq_contacts_missing_org(after_id: int = 0, limit: int = 200):
             <td>{html_escape(fn)}</td>
             <td>{html_escape(ln)}</td>
             <td style="width:340px;">
-              <div class="action-menu">
-                <button type="button" class="chip chip-primary action-btn" onclick="toggleActionMenu(this)">⋯ Aktionen</button>
-                <div class="menu" role="menu">
+              <details class="action-menu">
+                 <summary class="chip chip-primary action-btn">⋯ Aktionen</summary>
+                 <div class="menu" role="menu">
                   <a class="menu-item" href="/dq/contacts/person/{pid}">Bearbeiten</a>
                   <a class="menu-item" target="_blank" rel="noopener" href="{pipedrive_person_url(pid)}">Pipedrive ↗</a>
                   <button type="button" class="menu-item menu-danger" onclick="deletePerson({pid})">🗑 Löschen</button>
                 </div>
-              </div>
-            </td>
+               </details>
+             </td>
           </tr>
         """)
 
@@ -3991,6 +3987,16 @@ async def dq_orgs_no_contacts(after_id: int = 0, limit: int = 200):
 
     limit = max(50, min(int(limit), 500))
 
+    base_path = "/dq/orgs/no_contacts"
+    qs = []
+    if after_id:
+        qs.append(f"after_id={after_id}")
+    if limit:
+        qs.append(f"limit={limit}")
+    current_url = base_path + (("?" + "&".join(qs)) if qs else "")
+    back_q = urllib.parse.quote(current_url, safe="")
+
+
     sql = """
     SELECT o.id, o.name, o.website
     FROM orgs_cache o
@@ -4016,14 +4022,14 @@ async def dq_orgs_no_contacts(after_id: int = 0, limit: int = 200):
             <td>{html_escape(name)}</td>
             <td>{html_escape(website)}</td>
             <td style="width:180px;">
-              <div class="action-menu">
-                <button type="button" class="chip chip-primary action-btn" onclick="toggleActionMenu(this)">⋯ Aktionen</button>
-                <div class="menu" role="menu">
-                  <a class="menu-item" href="/dq/orgs/org/{oid}">Bearbeiten</a>
+              <details class="action-menu">
+                 <summary class="chip chip-primary action-btn">⋯ Aktionen</summary>
+                 <div class="menu" role="menu">
+                  <a class="menu-item" href="/dq/orgs/org/{oid}?back={back_q}">Bearbeiten</a>
                   <a class="menu-item" target="_blank" rel="noopener" href="{pipedrive_org_url(oid)}">Pipedrive ↗</a>
                 </div>
-              </div>
-            </td>
+               </details>
+             </td>
           </tr>
         """)
 
@@ -4087,15 +4093,15 @@ async def dq_contacts_email_mismatch(after_id: int = 0, limit: int = 200):
             <td>{html_escape(org_name)}<div class="small" style="opacity:.85">{html_escape(org_website)}</div></td>
             <td style="width:120px;"><code class="badge">{html_escape(reason)}</code></td>
             <td style="width:340px;">
-              <div class="action-menu">
-                <button type="button" class="chip chip-primary action-btn" onclick="toggleActionMenu(this)">⋯ Aktionen</button>
-                <div class="menu" role="menu">
+              <details class="action-menu">
+                 <summary class="chip chip-primary action-btn">⋯ Aktionen</summary>
+                 <div class="menu" role="menu">
                   <a class="menu-item" href="/dq/contacts/person/{pid}">Bearbeiten</a>
                   <a class="menu-item" target="_blank" rel="noopener" href="{pipedrive_person_url(pid)}">Pipedrive ↗</a>
                   <button type="button" class="menu-item menu-danger" onclick="deletePerson({pid})">🗑 Löschen</button>
                 </div>
-              </div>
-            </td>
+               </details>
+             </td>
           </tr>
         """)
 
@@ -4165,6 +4171,16 @@ async def dq_orgs_missing(field: str, after_id: int = 0, limit: int = 200):
         return HTMLResponse("DB nicht initialisiert", status_code=500)
 
     limit = max(50, min(int(limit), 500))
+
+    base_path = f"/dq/orgs/missing?field={urllib.parse.quote(field, safe='')}"
+    qs = []
+    if after_id:
+        qs.append(f"after_id={after_id}")
+    if limit:
+        qs.append(f"limit={limit}")
+    current_url = base_path + (("&" + "&".join(qs)) if qs else "")
+    back_q = urllib.parse.quote(current_url, safe="")
+
     if field not in ("name", "address", "website"):
         return HTMLResponse("Ungültiges Feld", status_code=400)
 
@@ -4195,14 +4211,14 @@ async def dq_orgs_missing(field: str, after_id: int = 0, limit: int = 200):
               
             </td>
             <td>
-              <div class="action-menu">
-                <button type="button" class="chip chip-primary action-btn" onclick="toggleActionMenu(this)">⋯ Aktionen</button>
-                <div class="menu" role="menu">
-                  <a class="menu-item" href="/dq/orgs/org/{oid}">Bearbeiten</a>
+              <details class="action-menu">
+                 <summary class="chip chip-primary action-btn">⋯ Aktionen</summary>
+                 <div class="menu" role="menu">
+                  <a class="menu-item" href="/dq/orgs/org/{oid}?back={back_q}">Bearbeiten</a>
                   <a class="menu-item" target="_blank" rel="noopener" href="{pipedrive_org_url(oid)}">Pipedrive ↗</a>
                 </div>
-              </div>
-            </td>
+               </details>
+             </td>
           </tr>
         """)
 
@@ -4249,6 +4265,16 @@ async def dq_orgs_invalidchars(field: str, after_id: int = 0, limit: int = 200):
         return HTMLResponse("DB nicht initialisiert", status_code=500)
 
     limit = max(50, min(int(limit), 500))
+
+    base_path = "/dq/orgs/invalidchars"
+    qs = []
+    if after_id:
+        qs.append(f"after_id={after_id}")
+    if limit:
+        qs.append(f"limit={limit}")
+    current_url = base_path + (("?" + "&".join(qs)) if qs else "")
+    back_q = urllib.parse.quote(current_url, safe="")
+
     if field != "name":
         return HTMLResponse("Invalidchars ist nur für name sinnvoll", status_code=400)
 
@@ -4299,14 +4325,14 @@ async def dq_orgs_invalidchars(field: str, after_id: int = 0, limit: int = 200):
               
             </td>
             <td>
-              <div class="action-menu">
-                <button type="button" class="chip chip-primary action-btn" onclick="toggleActionMenu(this)">⋯ Aktionen</button>
-                <div class="menu" role="menu">
-                  <a class="menu-item" href="/dq/orgs/org/{oid}">Bearbeiten</a>
+              <details class="action-menu">
+                 <summary class="chip chip-primary action-btn">⋯ Aktionen</summary>
+                 <div class="menu" role="menu">
+                  <a class="menu-item" href="/dq/orgs/org/{oid}?back={back_q}">Bearbeiten</a>
                   <a class="menu-item" target="_blank" rel="noopener" href="{pipedrive_org_url(oid)}">Pipedrive ↗</a>
                 </div>
-              </div>
-            </td>
+               </details>
+             </td>
           </tr>
         """)
 
