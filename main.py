@@ -38,7 +38,33 @@ OAUTH_AUTHORIZE_URL = "https://oauth.pipedrive.com/oauth/authorize"
 OAUTH_TOKEN_URL = "https://oauth.pipedrive.com/oauth/token"
 PIPEDRIVE_API_V2_URL = "https://api.pipedrive.com/api/v2"
 
-PIPEDRIVE_APP_URL = os.getenv("PIPEDRIVE_APP_URL", "https://app.pipedrive.com")
+def _normalize_pipedrive_app_url(url: str) -> str:
+    """Normalize Pipedrive app base URL.
+
+    Some environments provide a sandbox subdomain (e.g. '<company>-sandbox.pipedrive.com').
+    We always want the non-sandbox host in the generated record links.
+    """
+    try:
+        from urllib.parse import urlparse, urlunparse
+        u = urlparse(url)
+        scheme = u.scheme or 'https'
+        netloc = u.netloc or u.path  # allow passing host without scheme
+        path = u.path if u.netloc else ''
+        # strip possible credentials/port handling
+        # remove '-sandbox' in the left-most label
+        parts = netloc.split('@')
+        hostport = parts[-1]
+        userinfo = '@'.join(parts[:-1])
+        host, sep, port = hostport.partition(':')
+        host = host.replace('-sandbox.', '.')
+        host = host.replace('.sandbox.', '.')
+        hostport2 = host + (sep + port if sep else '')
+        netloc2 = (userinfo + '@' if userinfo else '') + hostport2
+        return urlunparse((scheme, netloc2, '', '', '', ''))
+    except Exception:
+        return url
+
+PIPEDRIVE_APP_URL = _normalize_pipedrive_app_url(os.getenv("PIPEDRIVE_APP_URL", "https://app.pipedrive.com"))
 
 def pipedrive_person_url(person_id: int) -> str:
     return f"{PIPEDRIVE_APP_URL}/person/{int(person_id)}"
@@ -2183,24 +2209,52 @@ def page_shell(title: str, body_html: str, back_href: str = "/overview") -> str:
                  border-bottom:1px solid rgba(15,23,42,.10);}
         tbody tr:nth-child(even){background:rgba(2,132,199,.03);}
         tbody tr:hover{background:rgba(14,165,233,.08);}
-        td, th{padding:10px 12px; vertical-align:top;}
+        td, th{padding:10px 12px; vertical-align:top; position:relative;}
         /* Sticky action column (last column) */
         th:last-child{position:sticky; right:0; z-index:6; background:rgba(255,255,255,.96);}
-        td:last-child{position:sticky; right:0; z-index:4; background-color:inherit;}
+        td:last-child{position:sticky; right:0; z-index:8; background-color:inherit; overflow:visible;}
         td:last-child::before{content:""; position:absolute; inset:0; background:inherit; z-index:-1;}
-        /* Action menu */
-        .action-menu{position:relative; display:inline-block;}
-        .action-menu .menu{display:none; position:absolute; right:0; top:calc(100% + 6px); min-width:180px;
-                           background:#fff; border:1px solid rgba(15,23,42,.12); border-radius:14px;
-                           box-shadow:0 12px 30px rgba(2,6,23,.14); padding:6px; z-index:60;}
+        /* Action menu (native details/summary) */
+        .action-menu{position:relative; display:inline-block; z-index:1;}
+        .action-menu[open]{z-index:999;}
+        .action-menu > summary{list-style:none;}
+        .action-menu > summary::-webkit-details-marker{display:none;}
+        .action-menu .menu{
+          display:none;
+          position:absolute;
+          right:0;
+          top:calc(100% + 8px);
+          min-width:220px;
+          background:#fff;
+          color:#0f172a;
+          border:1px solid rgba(15,23,42,.14);
+          border-radius:16px;
+          box-shadow:0 14px 34px rgba(2,6,23,.16);
+          padding:8px;
+          z-index:1000;
+        }
         .action-menu[open] .menu{display:block;}
-        .menu-item{display:flex; align-items:center; justify-content:flex-start; gap:8px;
-                   width:100%; padding:10px 10px; border-radius:12px;
-                   text-decoration:none; border:none; background:transparent; cursor:pointer; color:inherit; font-size:14px;}
-        .menu-item:hover{background:rgba(14,165,233,.10);}
+        .menu-item{
+          display:flex;
+          align-items:center;
+          justify-content:flex-start;
+          gap:10px;
+          width:100%;
+          padding:10px 12px;
+          border-radius:12px;
+          text-decoration:none;
+          border:none;
+          background:transparent;
+          cursor:pointer;
+          color:#0f172a;
+          font-size:14px;
+          font-weight:600;
+        }
+        .menu-item:hover{background:rgba(14,165,233,.12);}
+        .menu-item:focus{outline:2px solid rgba(14,165,233,.35); outline-offset:2px;}
         .menu-danger{color:#b91c1c;}
-        .menu-danger:hover{background:rgba(239,68,68,.10);}
-        .action-btn{min-width:120px; justify-content:center;}
+        .menu-danger:hover{background:rgba(239,68,68,.12);}
+        .action-btn{min-width:132px; justify-content:center;}
 
         .mono{font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono','Courier New', monospace; font-size:13px;}
       </style>
@@ -2471,15 +2525,6 @@ async def overview(request: Request):
         </div>
       </div>
 
-      <div class="panel" style="margin-bottom:14px;">
-        <div class="small" style="display:flex; flex-wrap:wrap; gap:12px; align-items:center;">
-          <div><b>Gesamt:</b></div>
-          <div>Kontakte{_tot_badge(total_contacts)}</div>
-          <div>Freelancer{_tot_badge(total_freelancers)}</div>
-          <div>Organisationen{_tot_badge(total_orgs)}</div>
-        </div>
-      </div>
-
       {_render_cards("Kontakte", counts)}
       {_render_cards("Freelancer", counts)}
       {_render_cards("Organisationen", counts)}
@@ -2503,9 +2548,7 @@ async def admin_page():
         <div class="title">Admin – Sync</div>
         <div class="subtitle">Starte Sync-Jobs in Batches (perfekt für große Datenmengen).</div>
       </div>
-      <div style="display:flex; gap:10px;">
-        <a class="btn btn-outline" href="/overview">← Zur Übersicht</a>
-      </div>
+      <div style="display:flex; gap:10px;">      </div>
     </div>
 
     <div class="panel">
@@ -2732,6 +2775,9 @@ async def _render_missing_list(
     - CSV Export der Auswahl
     - Excel Import (Bulk Update)
     """
+    back_url = f"{base_path}?after_id={after_id}&limit={limit}"
+    back_q = urllib.parse.quote(back_url, safe="")
+
     async with db_pool.acquire() as conn:
         if freelancer_mode in ("only", "exclude"):
             rows = await conn.fetch(sql, after_id, limit, FREELANCER_ORG_NAME)
@@ -2759,7 +2805,7 @@ async def _render_missing_list(
                  <div class="menu" role="menu">
                   <a class="menu-item" href="/dq/contacts/person/{pid}?back={back_q}">Bearbeiten</a>
                   <a class="menu-item" target="_blank" rel="noopener" href="{pipedrive_person_url(pid)}">Pipedrive ↗</a>
-                  <button type="button" class="menu-item menu-danger" onclick="deletePerson({pid})">🗑 Löschen</button>
+                  <a class="menu-item menu-danger" href="/dq/contacts/person/{pid}/delete_confirm?back={back_q}">🗑 Löschen</a>
                 </div>
                </details>
              </td>
@@ -2799,9 +2845,7 @@ async def _render_missing_list(
           <div class="title">{html_escape(title)}</div>
           <div class="subtitle">{html_escape(subtitle)}</div>
         </div>
-        <div style="display:flex; gap:10px;">
-          <a class="btn btn-outline" href="/overview">← Zur Übersicht</a>
-          {next_link}
+        <div style="display:flex; gap:10px;">          {next_link}
         </div>
       </div>
 
@@ -3073,7 +3117,7 @@ async def dq_first_name_invalidchars(after_id: int = 0, limit: int = 200):
                  <div class="menu" role="menu">
                   <a class="menu-item" href="/dq/contacts/person/{pid}">Bearbeiten</a>
                   <a class="menu-item" target="_blank" rel="noopener" href="{pipedrive_person_url(pid)}">Pipedrive ↗</a>
-                  <button type="button" class="menu-item menu-danger" onclick="deletePerson({pid})">🗑 Löschen</button>
+                  <a class="menu-item menu-danger" href="/dq/contacts/person/{pid}/delete_confirm?back={back_q}">🗑 Löschen</a>
                 </div>
                </details>
              </td>
@@ -3091,9 +3135,7 @@ async def dq_first_name_invalidchars(after_id: int = 0, limit: int = 200):
           <div class="subtitle">Kontakte (ohne Freelancer) </div>
           <div class="subtitle"><span class="small">Erlaubt: Buchstaben inkl. Akzente, Leerzeichen, Bindestrich, Punkt, Apostroph. Nicht erlaubt: Emojis, Zahlen, Steuerzeichen.</span></div>
         </div>
-        <div style="display:flex; gap:10px;">
-          <a class="btn btn-outline" href="/overview">← Zur Übersicht</a>
-          {next_link}
+        <div style="display:flex; gap:10px;">          {next_link}
         </div>
       </div>
 
@@ -3142,7 +3184,7 @@ async def dq_last_name_invalidchars(after_id: int = 0, limit: int = 200):
                  <div class="menu" role="menu">
                   <a class="menu-item" href="/dq/contacts/person/{pid}">Bearbeiten</a>
                   <a class="menu-item" target="_blank" rel="noopener" href="{pipedrive_person_url(pid)}">Pipedrive ↗</a>
-                  <button type="button" class="menu-item menu-danger" onclick="deletePerson({pid})">🗑 Löschen</button>
+                  <a class="menu-item menu-danger" href="/dq/contacts/person/{pid}/delete_confirm?back={back_q}">🗑 Löschen</a>
                 </div>
                </details>
              </td>
@@ -3159,9 +3201,7 @@ async def dq_last_name_invalidchars(after_id: int = 0, limit: int = 200):
           <div class="title">Nachname – Ungültige Zeichen</div>
           <div class="subtitle">Kontakte (ohne Freelancer) </div>
         </div>
-        <div style="display:flex; gap:10px;">
-          <a class="btn btn-outline" href="/overview">← Zur Übersicht</a>
-          {next_link}
+        <div style="display:flex; gap:10px;">          {next_link}
         </div>
       </div>
 
@@ -3230,7 +3270,7 @@ async def dq_first_name_title(after_id: int = 0, limit: int = 200):
                  <div class="menu" role="menu">
                   <a class="menu-item" href="/dq/contacts/person/{pid}">Bearbeiten</a>
                   <a class="menu-item" target="_blank" rel="noopener" href="{pipedrive_person_url(pid)}">Pipedrive ↗</a>
-                  <button type="button" class="menu-item menu-danger" onclick="deletePerson({pid})">🗑 Löschen</button>
+                  <a class="menu-item menu-danger" href="/dq/contacts/person/{pid}/delete_confirm?back={back_q}">🗑 Löschen</a>
                 </div>
                </details>
              </td>
@@ -3247,9 +3287,7 @@ async def dq_first_name_title(after_id: int = 0, limit: int = 200):
           <div class="title">Vorname – Titel im Vornamen</div>
           <div class="subtitle">Liste aus Cache-DB · Page size: {limit}</div>
         </div>
-        <div style="display:flex; gap:10px;">
-          <a class="btn btn-outline" href="/overview">← Zur Übersicht</a>
-          {next_link}
+        <div style="display:flex; gap:10px;">          {next_link}
         </div>
       </div>
 
@@ -3423,6 +3461,51 @@ async def dq_person_delete(person_id: int):
         return JSONResponse({"ok": True})
     except Exception as e:
         return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
+
+
+@app.get("/dq/contacts/person/{person_id}/delete_confirm", response_class=HTMLResponse)
+async def dq_person_delete_confirm(person_id: int, back: str = ""):
+    if "default" not in user_tokens:
+        return RedirectResponse("/login")
+    back_href = back if (back and isinstance(back, str) and back.startswith("/")) else "/overview"
+    body = f"""
+      <div class="topbar">
+        <div>
+          <div class="title">Kontakt löschen</div>
+          <div class="subtitle">ID: <code class="badge">{person_id}</code> – diese Aktion kann nicht rückgängig gemacht werden.</div>
+        </div>
+      </div>
+
+      <div class="panel" style="border-color: rgba(239,68,68,.35);">
+        <p style="margin:0 0 14px 0;">
+          Soll der Kontakt wirklich in <b>Pipedrive</b> gelöscht werden?
+        </p>
+        <div style="display:flex; gap:10px; flex-wrap:wrap;">
+          <a class="btn btn-outline" href="{html_escape(back_href)}">Abbrechen</a>
+          <form method="post" action="/dq/contacts/person/{person_id}/delete_form" style="margin:0;">
+            <input type="hidden" name="back" value="{html_escape(back_href)}"/>
+            <button class="btn btn-primary" style="background:#ef4444; border-color:#ef4444;">🗑 Endgültig löschen</button>
+          </form>
+        </div>
+      </div>
+    """
+    return HTMLResponse(page_shell("Kontakt löschen", body, back_href=back_href))
+
+
+@app.post("/dq/contacts/person/{person_id}/delete_form")
+async def dq_person_delete_form(person_id: int, back: str = Form(default="/overview")):
+    if "default" not in user_tokens:
+        return RedirectResponse("/login")
+    headers = get_headers()
+    if not headers:
+        return RedirectResponse("/login")
+    back_href = back if (back and isinstance(back, str) and back.startswith("/")) else "/overview"
+    try:
+        await pipedrive_delete_v2("persons", int(person_id), headers)
+        await db_delete_person_cache(int(person_id))
+    except Exception:
+        pass
+    return RedirectResponse(back_href, status_code=303)
 
 
 @app.post("/dq/contacts/person/{person_id}/update")
@@ -3924,7 +4007,7 @@ async def dq_contacts_missing_org(after_id: int = 0, limit: int = 200):
                  <div class="menu" role="menu">
                   <a class="menu-item" href="/dq/contacts/person/{pid}">Bearbeiten</a>
                   <a class="menu-item" target="_blank" rel="noopener" href="{pipedrive_person_url(pid)}">Pipedrive ↗</a>
-                  <button type="button" class="menu-item menu-danger" onclick="deletePerson({pid})">🗑 Löschen</button>
+                  <a class="menu-item menu-danger" href="/dq/contacts/person/{pid}/delete_confirm?back={back_q}">🗑 Löschen</a>
                 </div>
                </details>
              </td>
@@ -4098,7 +4181,7 @@ async def dq_contacts_email_mismatch(after_id: int = 0, limit: int = 200):
                  <div class="menu" role="menu">
                   <a class="menu-item" href="/dq/contacts/person/{pid}">Bearbeiten</a>
                   <a class="menu-item" target="_blank" rel="noopener" href="{pipedrive_person_url(pid)}">Pipedrive ↗</a>
-                  <button type="button" class="menu-item menu-danger" onclick="deletePerson({pid})">🗑 Löschen</button>
+                  <a class="menu-item menu-danger" href="/dq/contacts/person/{pid}/delete_confirm?back={back_q}">🗑 Löschen</a>
                 </div>
                </details>
              </td>
@@ -4232,9 +4315,7 @@ async def dq_orgs_missing(field: str, after_id: int = 0, limit: int = 200):
           <div class="title">Organisationen – Fehlende Daten</div>
           <div class="subtitle">Feld: {html_escape(field)} </div>
         </div>
-        <div style="display:flex; gap:10px;">
-          <a class="btn btn-outline" href="/overview">← Zur Übersicht</a>
-          {next_link}
+        <div style="display:flex; gap:10px;">          {next_link}
         </div>
       </div>
 
@@ -4344,9 +4425,7 @@ async def dq_orgs_invalidchars(field: str, after_id: int = 0, limit: int = 200):
           <div class="title">Organisationen – Ungültige Zeichen</div>
           <div class="subtitle">Feld: name </div>
         </div>
-        <div style="display:flex; gap:10px;">
-          <a class="btn btn-outline" href="/overview">← Zur Übersicht</a>
-          {next_link}
+        <div style="display:flex; gap:10px;">          {next_link}
         </div>
       </div>
 
