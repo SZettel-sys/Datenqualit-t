@@ -3,6 +3,7 @@ import re
 import json
 import csv
 import io
+import html
 import uuid
 import urllib.parse
 import httpx
@@ -20,6 +21,32 @@ from fastapi.staticfiles import StaticFiles
 from datetime import datetime, timezone, timedelta
 
 app = FastAPI()
+
+def _html_error_page(title: str, message: str, detail: str = "") -> str:
+    detail_html = f"<pre style='white-space:pre-wrap;background:#0b1220;color:#e2e8f0;padding:14px;border-radius:12px;overflow:auto'>{html.escape(detail)}</pre>" if detail else ""
+    return page_shell(title, f"""
+      <div class='card'>
+        <h2 style='margin:0 0 10px'>{html.escape(message)}</h2>
+        <p style='margin:0 0 12px; color:rgba(15,23,42,.75)'>Bitte prüfe die Server-Logs. Unten sind Details für die Fehlersuche.</p>
+        {detail_html}
+        <div style='margin-top:14px'>
+          <a class='chip chip-primary' href='/overview'>Zur Übersicht</a>
+        </div>
+      </div>
+    """)
+
+@app.exception_handler(Exception)
+async def _unhandled_exception_handler(request: Request, exc: Exception):
+    # In PROD keep it short; if DEBUG=1, include traceback.
+    debug = os.getenv("DEBUG", "").strip() in ("1", "true", "True", "yes", "YES")
+    tb = ""
+    if debug:
+        import traceback as _tb
+        tb = "".join(_tb.format_exception(type(exc), exc, exc.__traceback__))
+    else:
+        tb = f"{type(exc).__name__}: {exc}"
+    return HTMLResponse(_html_error_page("Interner Fehler", f"{type(exc).__name__}", tb), status_code=500)
+
 
 ########################################################################
 #
@@ -43,24 +70,42 @@ def _normalize_pipedrive_app_url(url: str) -> str:
 
     Some environments provide a sandbox subdomain (e.g. '<company>-sandbox.pipedrive.com').
     We always want the non-sandbox host in the generated record links.
+
+    This function is intentionally defensive: it strips trailing slashes and accidental path parts
+    if the value is provided without a scheme.
     """
     try:
         from urllib.parse import urlparse, urlunparse
-        u = urlparse(url)
-        scheme = u.scheme or 'https'
+
+        raw = (url or "").strip()
+        if not raw:
+            return "https://app.pipedrive.com"
+
+        u = urlparse(raw)
+
+        scheme = u.scheme or "https"
         netloc = u.netloc or u.path  # allow passing host without scheme
-        path = u.path if u.netloc else ''
+        netloc = netloc.strip().strip("/")
+
+        # If someone passed a host + path without scheme (e.g. 'foo.pipedrive.com/person'),
+        # keep only the host part.
+        if "/" in netloc:
+            netloc = netloc.split("/", 1)[0]
+
         # strip possible credentials/port handling
-        # remove '-sandbox' in the left-most label
-        parts = netloc.split('@')
+        parts = netloc.split("@")
         hostport = parts[-1]
-        userinfo = '@'.join(parts[:-1])
-        host, sep, port = hostport.partition(':')
-        host = host.replace('-sandbox.', '.')
-        host = host.replace('.sandbox.', '.')
-        hostport2 = host + (sep + port if sep else '')
-        netloc2 = (userinfo + '@' if userinfo else '') + hostport2
-        return urlunparse((scheme, netloc2, '', '', '', ''))
+        userinfo = "@".join(parts[:-1])
+
+        host, sep, port = hostport.partition(":")
+
+        # remove sandbox markers robustly (handles '-sandbox' and '.sandbox' variants)
+        host = host.replace("-sandbox", "")
+        host = host.replace(".sandbox", "")
+
+        hostport2 = host + (sep + port if sep else "")
+        netloc2 = (userinfo + "@" if userinfo else "") + hostport2
+        return urlunparse((scheme, netloc2, "", "", "", ""))
     except Exception:
         return url
 
@@ -2212,11 +2257,15 @@ def page_shell(title: str, body_html: str, back_href: str = "/overview") -> str:
         td, th{padding:10px 12px; vertical-align:top; position:relative;}
         /* Sticky action column (last column) */
         th:last-child{position:sticky; right:0; z-index:6; background:rgba(255,255,255,.96);}
-        td:last-child{position:sticky; right:0; z-index:8; background-color:inherit; overflow:visible;}
-        td:last-child::before{content:""; position:absolute; inset:0; background:inherit; z-index:-1;}
+        td:last-child{position:sticky; right:0; z-index:2; background:rgba(255,255,255,.98); overflow:visible;}
+        /* When an action menu is open, lift this cell above other sticky cells (prevents overlap) */
+        td:last-child:has(details[open]){z-index:999;}
+
         /* Action menu (native details/summary) */
         .action-menu{position:relative; display:inline-block; z-index:1;}
         .action-menu[open]{z-index:999;}
+        .action-menu[open] .menu{filter:none;}
+
         .action-menu > summary{list-style:none;}
         .action-menu > summary::-webkit-details-marker{display:none;}
         .action-menu .menu{
@@ -2229,7 +2278,7 @@ def page_shell(title: str, body_html: str, back_href: str = "/overview") -> str:
           color:#0f172a;
           border:1px solid rgba(15,23,42,.14);
           border-radius:16px;
-          box-shadow:0 14px 34px rgba(2,6,23,.16);
+          box-shadow:0 18px 44px rgba(2,6,23,.20);
           padding:8px;
           z-index:1000;
         }
