@@ -102,6 +102,10 @@ def _normalize_pipedrive_app_url(url: str) -> str:
         # remove sandbox markers robustly (handles '-sandbox' and '.sandbox' variants)
         host = host.replace("-sandbox", "")
         host = host.replace(".sandbox", "")
+        # extra hardening: handle 'sandbox.' prefix or 'sandbox-' prefix
+        host = re.sub(r"^sandbox[\.-]", "", host)
+        host = re.sub(r"[\.-]sandbox(?=\.)", "", host)
+
 
         hostport2 = host + (sep + port if sep else "")
         netloc2 = (userinfo + "@" if userinfo else "") + hostport2
@@ -2270,9 +2274,8 @@ def page_shell(title: str, body_html: str, back_href: str = "/overview") -> str:
         .action-menu > summary::-webkit-details-marker{display:none;}
         .action-menu .menu{
           display:none;
-          position:absolute;
-          right:0;
-          top:calc(100% + 8px);
+          position:static; /* no overlay -> better readability */
+          margin-top:10px;
           min-width:220px;
           background:#fff;
           color:#0f172a;
@@ -2280,7 +2283,6 @@ def page_shell(title: str, body_html: str, back_href: str = "/overview") -> str:
           border-radius:16px;
           box-shadow:0 18px 44px rgba(2,6,23,.20);
           padding:8px;
-          z-index:1000;
         }
         .action-menu[open] .menu{display:block;}
         .menu-item{
@@ -3148,6 +3150,16 @@ async def dq_first_name_invalidchars(after_id: int = 0, limit: int = 200):
         return HTMLResponse("DB nicht initialisiert", status_code=500)
 
     limit = max(50, min(int(limit), 500))
+
+    base_path = "/dq/contacts/first_name/invalidchars"
+    qs = []
+    if after_id:
+        qs.append(f"after_id={after_id}")
+    if limit:
+        qs.append(f"limit={limit}")
+    current_url = base_path + (("?" + "&".join(qs)) if qs else "")
+    back_q = urllib.parse.quote(current_url, safe="")
+
     rows, next_after = await _db_collect_invalid_person_name_rows("first_name", after_id, limit, freelancer_mode="exclude")
 
     trs = []
@@ -3215,6 +3227,16 @@ async def dq_last_name_invalidchars(after_id: int = 0, limit: int = 200):
         return HTMLResponse("DB nicht initialisiert", status_code=500)
 
     limit = max(50, min(int(limit), 500))
+
+    base_path = "/dq/contacts/last_name/invalidchars"
+    qs = []
+    if after_id:
+        qs.append(f"after_id={after_id}")
+    if limit:
+        qs.append(f"limit={limit}")
+    current_url = base_path + (("?" + "&".join(qs)) if qs else "")
+    back_q = urllib.parse.quote(current_url, safe="")
+
     rows, next_after = await _db_collect_invalid_person_name_rows("last_name", after_id, limit, freelancer_mode="exclude")
 
     trs = []
@@ -3286,6 +3308,16 @@ async def dq_first_name_title(after_id: int = 0, limit: int = 200):
         return HTMLResponse("DB nicht initialisiert", status_code=500)
 
     limit = max(50, min(int(limit), 500))
+
+    base_path = "/dq/contacts/first_name/title"
+    qs = []
+    if after_id:
+        qs.append(f"after_id={after_id}")
+    if limit:
+        qs.append(f"limit={limit}")
+    current_url = base_path + (("?" + "&".join(qs)) if qs else "")
+    back_q = urllib.parse.quote(current_url, safe="")
+
     pattern = r"^\s*(dr\.?|prof\.?|mr\.?|mrs\.?|ms\.?|herr|frau)(\s|\.|$)"
 
     sql = """
@@ -4025,6 +4057,16 @@ async def dq_contacts_missing_org(after_id: int = 0, limit: int = 200):
         return HTMLResponse("DB nicht initialisiert", status_code=500)
 
     limit = max(50, min(int(limit), 500))
+
+    base_path = "/dq/contacts/org/missing"
+    qs = []
+    if after_id:
+        qs.append(f"after_id={after_id}")
+    if limit:
+        qs.append(f"limit={limit}")
+    current_url = base_path + (("?" + "&".join(qs)) if qs else "")
+    back_q = urllib.parse.quote(current_url, safe="")
+
     sql = """
     SELECT id, first_name, last_name
     FROM persons_cache
@@ -4203,6 +4245,16 @@ async def dq_contacts_email_mismatch(after_id: int = 0, limit: int = 200):
         return HTMLResponse("DB nicht initialisiert", status_code=500)
 
     limit = max(50, min(int(limit), 500))
+
+    base_path = "/dq/contacts/email/mismatch"
+    qs = []
+    if after_id:
+        qs.append(f"after_id={after_id}")
+    if limit:
+        qs.append(f"limit={limit}")
+    current_url = base_path + (("?" + "&".join(qs)) if qs else "")
+    back_q = urllib.parse.quote(current_url, safe="")
+
     rows, next_after = await _db_collect_email_mismatch_rows(after_id, limit)
 
     trs = []
