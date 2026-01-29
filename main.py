@@ -2556,9 +2556,8 @@ async def overview(request: Request):
 
     counts = await compute_overview_counts() if db_pool else {}
 
-    def _group_total(group_name: str) -> Optional[int]:
+    def _group_total(group_name: str) -> int:
         total = 0
-        seen_any = False
         for c in DQ_CARDS:
             if c.get("group") != group_name:
                 continue
@@ -2566,13 +2565,7 @@ async def overview(request: Request):
                 n = counts.get(a.get("href"))
                 if isinstance(n, int):
                     total += n
-                    seen_any = True
-        return total if seen_any else None
-
-    def _tot_badge(n: Optional[int]) -> str:
-        if n is None:
-            return ""
-        return f'<span style="margin-left:10px; padding:4px 10px; border-radius:999px; font-size:12px; background:rgba(15,23,42,.08); color:#0f172a;">Summe: <b>{int(n)}</b></span>'
+        return int(total)
 
     total_contacts = _group_total("Kontakte")
     total_freelancers = _group_total("Freelancer")
@@ -2581,11 +2574,8 @@ async def overview(request: Request):
     body = f"""
       <div class="topbar">
         <div>
-          <div class="title">Datenqualität – Übersicht</div>
-          <div class="subtitle">
-            Kontakte = Personen <b>ohne</b> Organisation „{html_escape(FREELANCER_ORG_NAME)}“ ·
-            Freelancer = Personen mit Organisation „{html_escape(FREELANCER_ORG_NAME)}“
-          </div>
+          <div class="title">Datenqualität</div>
+          <div class="subtitle">Wähle einen Bereich</div>
         </div>
         <div style="display:flex; gap:10px; align-items:center;">
           <a class="btn btn-outline" href="/admin">Admin</a>
@@ -2593,11 +2583,29 @@ async def overview(request: Request):
         </div>
       </div>
 
-      {_render_cards("Kontakte", counts)}
-      {_render_cards("Freelancer", counts)}
-      {_render_cards("Organisationen", counts)}
+      <div class="tiles">
+        <a class="tile" href="/overview/contacts">
+          <div class="tile-title">Kontakte</div>
+          <div class="tile-count">{total_contacts}</div>
+          <div class="tile-sub">Personen ohne Organisation "{html_escape(FREELANCER_ORG_NAME)}"</div>
+        </a>
+
+        <a class="tile" href="/overview/freelancer">
+          <div class="tile-title">Freelancer</div>
+          <div class="tile-count">{total_freelancers}</div>
+          <div class="tile-sub">Personen mit Organisation "{html_escape(FREELANCER_ORG_NAME)}"</div>
+        </a>
+
+        <a class="tile" href="/overview/orgs">
+          <div class="tile-title">Organisationen</div>
+          <div class="tile-count">{total_orgs}</div>
+          <div class="tile-sub">Organisation-Prüfungen</div>
+        </a>
+      </div>
     """
-    return HTMLResponse(page_shell("Datenqualität – Übersicht", body))
+    # Landing page: no back button
+    return HTMLResponse(page_shell("Datenqualität – Übersicht", body, back_href=""))
+
 
 
 
