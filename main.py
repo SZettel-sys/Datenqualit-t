@@ -2235,6 +2235,15 @@ def page_shell(title: str, body_html: str, back_href: str = "/overview") -> str:
     else:
         logo_html = '<header><div style="font-weight:900;letter-spacing:.2px">bizforward · Datenqualität</div></header>'
 
+    
+    backbar_html = ""
+    if back_href:
+        backbar_html = f'''
+        <div class="backbar">
+          <a class="btn btn-outline btn-inline" href="{html_escape(back_href)}">← Zurück</a>
+          <a class="btn btn-outline btn-inline" href="/overview">Übersicht</a>
+        </div>
+        '''
     html = """
     <html>
     <head>
@@ -2307,16 +2316,24 @@ def page_shell(title: str, body_html: str, back_href: str = "/overview") -> str:
         .menu-danger:hover{background:rgba(239,68,68,.12);}
         .action-btn{min-width:132px; justify-content:center;}
 
+        
+        /* Landing tiles */
+        .tiles{display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:18px; margin-top:18px;}
+        .tile{display:block; padding:22px 20px; border-radius:18px; background:#fff; border:1px solid rgba(15,23,42,.10);
+              box-shadow:0 8px 26px rgba(2,6,23,.06); text-decoration:none; color:inherit; transition:transform .12s ease, border-color .12s ease;}
+        .tile:hover{border-color: rgba(2,132,199,.35); transform: translateY(-1px);}
+        .tile-title{font-weight:900; letter-spacing:.02em; font-size:16px; margin-bottom:10px;}
+        .tile-count{font-size:36px; font-weight:900; line-height:1; margin-bottom:10px;}
+        .tile-sub{font-size:13px; color: rgba(15,23,42,.65);}
+        @media (max-width: 980px){ .tiles{grid-template-columns:1fr;} }
+
         .mono{font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono','Courier New', monospace; font-size:13px;}
       </style>
     </head>
     <body>
       __LOGO_HTML__
       <div class="container">
-        <div class="backbar">
-          <a class="btn btn-outline btn-inline" href="__BACK_HREF__">← Zurück</a>
-          <a class="btn btn-outline btn-inline" href="/overview">Übersicht</a>
-        </div>
+        __BACKBAR_HTML__
         __BODY_HTML__
       </div>
       <script>
@@ -2412,7 +2429,7 @@ def page_shell(title: str, body_html: str, back_href: str = "/overview") -> str:
             .replace("__CSS_VERSION__", str(CSS_VERSION))
             .replace("__LOGO_HTML__", logo_html)
             .replace("__BODY_HTML__", body_html)
-            .replace("__BACK_HREF__", html_escape(back_href)))
+            .replace("__BACKBAR_HTML__", backbar_html))
 
 
 DQ_CARDS = [
@@ -2581,6 +2598,72 @@ async def overview(request: Request):
       {_render_cards("Organisationen", counts)}
     """
     return HTMLResponse(page_shell("Datenqualität – Übersicht", body))
+
+onse(page_shell("Datenqualität – Übersicht", body, back_href=""))
+
+
+@app.get("/overview/contacts", response_class=HTMLResponse)
+async def overview_contacts(request: Request):
+    if "default" not in user_tokens:
+        return RedirectResponse("/login")
+    counts = await compute_overview_counts() if db_pool else {}
+    body = f'''
+      <div class="topbar">
+        <div>
+          <div class="title">Kontakte</div>
+          <div class="subtitle"><a class="chip chip-link" href="/overview">‹ Übersicht</a></div>
+        </div>
+        <div style="display:flex; gap:10px; align-items:center;">
+          <a class="btn btn-outline" href="/admin">Admin</a>
+          <a class="btn btn-outline" href="/logout">Logout</a>
+        </div>
+      </div>
+      {_render_cards("Kontakte", counts)}
+    '''
+    return HTMLResponse(page_shell("Kontakte – Übersicht", body, back_href="/overview"))
+
+
+@app.get("/overview/freelancer", response_class=HTMLResponse)
+async def overview_freelancer(request: Request):
+    if "default" not in user_tokens:
+        return RedirectResponse("/login")
+    counts = await compute_overview_counts() if db_pool else {}
+    body = f'''
+      <div class="topbar">
+        <div>
+          <div class="title">Freelancer</div>
+          <div class="subtitle"><a class="chip chip-link" href="/overview">‹ Übersicht</a></div>
+        </div>
+        <div style="display:flex; gap:10px; align-items:center;">
+          <a class="btn btn-outline" href="/admin">Admin</a>
+          <a class="btn btn-outline" href="/logout">Logout</a>
+        </div>
+      </div>
+      {_render_cards("Freelancer", counts)}
+    '''
+    return HTMLResponse(page_shell("Freelancer – Übersicht", body, back_href="/overview"))
+
+
+@app.get("/overview/orgs", response_class=HTMLResponse)
+async def overview_orgs(request: Request):
+    if "default" not in user_tokens:
+        return RedirectResponse("/login")
+    counts = await compute_overview_counts() if db_pool else {}
+    body = f'''
+      <div class="topbar">
+        <div>
+          <div class="title">Organisationen</div>
+          <div class="subtitle"><a class="chip chip-link" href="/overview">‹ Übersicht</a></div>
+        </div>
+        <div style="display:flex; gap:10px; align-items:center;">
+          <a class="btn btn-outline" href="/admin">Admin</a>
+          <a class="btn btn-outline" href="/logout">Logout</a>
+        </div>
+      </div>
+      {_render_cards("Organisationen", counts)}
+    '''
+    return HTMLResponse(page_shell("Organisationen – Übersicht", body, back_href="/overview"))
+
 
 ########################################################################
 #
