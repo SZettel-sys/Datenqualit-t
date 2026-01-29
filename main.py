@@ -2317,15 +2317,20 @@ def page_shell(title: str, body_html: str, back_href: str = "/overview") -> str:
         .action-btn{min-width:132px; justify-content:center;}
 
         
-        /* Landing tiles */
-        .tiles{display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:18px; margin-top:18px;}
-        .tile{display:block; padding:22px 20px; border-radius:18px; background:#fff; border:1px solid rgba(15,23,42,.10);
-              box-shadow:0 8px 26px rgba(2,6,23,.06); text-decoration:none; color:inherit; transition:transform .12s ease, border-color .12s ease;}
-        .tile:hover{border-color: rgba(2,132,199,.35); transform: translateY(-1px);}
-        .tile-title{font-weight:900; letter-spacing:.02em; font-size:16px; margin-bottom:10px;}
-        .tile-count{font-size:36px; font-weight:900; line-height:1; margin-bottom:10px;}
-        .tile-sub{font-size:13px; color: rgba(15,23,42,.65);}
-        @media (max-width: 980px){ .tiles{grid-template-columns:1fr;} }
+        
+/* Landing tiles */
+.tiles{display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:16px; margin-top:18px;}
+.tile{display:block; padding:16px 16px; border-radius:18px; background:#fff;
+      border:1px solid rgba(15,23,42,.10); box-shadow:0 8px 26px rgba(2,6,23,.06);
+      text-decoration:none; color:inherit; transition:transform .12s ease, border-color .12s ease, box-shadow .12s ease;}
+.tile:hover{border-color:rgba(2,132,199,.35); box-shadow:0 10px 30px rgba(2,6,23,.08); transform: translateY(-1px);}
+.tile-row{display:flex; align-items:center; gap:12px;}
+.tile-icon{width:40px; height:40px; border-radius:14px; display:flex; align-items:center; justify-content:center;
+           background:rgba(14,165,233,.08); border:1px solid rgba(14,165,233,.18); font-size:18px;}
+.tile-title{font-weight:900; letter-spacing:.01em; font-size:16px;}
+.tile-chevron{margin-left:auto; font-size:22px; color:rgba(15,23,42,.55);}
+@media (max-width: 980px){ .tiles{grid-template-columns:1fr;} }
+
 
         .mono{font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono','Courier New', monospace; font-size:13px;}
       </style>
@@ -2583,25 +2588,31 @@ async def overview(request: Request):
         </div>
       </div>
 
-      <div class="tiles">
-        <a class="tile" href="/overview/contacts">
-          <div class="tile-title">Kontakte</div>
-          <div class="tile-count">{total_contacts}</div>
-          <div class="tile-sub">Personen ohne Organisation "{html_escape(FREELANCER_ORG_NAME)}"</div>
-        </a>
+<div class="tiles">
+  <a class="tile" href="/overview/contacts">
+    <div class="tile-row">
+      <div class="tile-icon" aria-hidden="true">👤</div>
+      <div class="tile-title">Kontakte</div>
+      <div class="tile-chevron" aria-hidden="true">›</div>
+    </div>
+  </a>
 
-        <a class="tile" href="/overview/freelancer">
-          <div class="tile-title">Freelancer</div>
-          <div class="tile-count">{total_freelancers}</div>
-          <div class="tile-sub">Personen mit Organisation "{html_escape(FREELANCER_ORG_NAME)}"</div>
-        </a>
+  <a class="tile" href="/overview/freelancer">
+    <div class="tile-row">
+      <div class="tile-icon" aria-hidden="true">🧑‍💻</div>
+      <div class="tile-title">Freelancer</div>
+      <div class="tile-chevron" aria-hidden="true">›</div>
+    </div>
+  </a>
 
-        <a class="tile" href="/overview/orgs">
-          <div class="tile-title">Organisationen</div>
-          <div class="tile-count">{total_orgs}</div>
-          <div class="tile-sub">Organisation-Prüfungen</div>
-        </a>
-      </div>
+  <a class="tile" href="/overview/orgs">
+    <div class="tile-row">
+      <div class="tile-icon" aria-hidden="true">🏢</div>
+      <div class="tile-title">Organisationen</div>
+      <div class="tile-chevron" aria-hidden="true">›</div>
+    </div>
+  </a>
+</div>
     """
     # Landing page: no back button
     return HTMLResponse(page_shell("Datenqualität – Übersicht", body, back_href=""))
