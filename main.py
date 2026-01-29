@@ -499,7 +499,7 @@ async def dq_bulk_csv_export(entity: str = Query(...), ids: str = Query(...)):
         return JSONResponse({"ok": False, "error": "DB nicht initialisiert"}, status_code=500)
 
     entity = (entity or "").strip().lower()
-    id_list = _parse_ids_param(ids)
+    id_list = ([int(x) for x in id] if id else _parse_ids_param(ids))
     if entity not in ("person", "organization"):
         return JSONResponse({"ok": False, "error": "entity muss 'person' oder 'organization' sein"}, status_code=400)
     if not id_list:
@@ -540,7 +540,7 @@ async def dq_bulk_csv_export(entity: str = Query(...), ids: str = Query(...)):
 
 
 @app.get("/dq/bulk/xlsx/selected")
-async def dq_bulk_xlsx_export_selected(entity: str = Query(...), ids: str = Query(...), field_key: str = Query("")):
+async def dq_bulk_xlsx_export_selected(entity: str = Query(...), ids: str = Query(""), id: list[int] = Query(default=[]), field_key: str = Query("")):
     """
     Excel-Export (XLSX) für ausgewählte Datensätze.
 
@@ -2924,7 +2924,7 @@ async def _render_missing_list(
 
     Neu:
     - Checkbox-Auswahl
-    - CSV Export der Auswahl
+    - Excel-Export der Auswahl (ohne JavaScript; via Query-Parameter id=...)
     - Excel Import (Bulk Update)
     """
     back_url = f"{base_path}?after_id={after_id}&limit={limit}"
@@ -2946,7 +2946,7 @@ async def _render_missing_list(
         trs.append(f"""
           <tr>
             <td style="width:48px; text-align:center;">
-              <input class="rowchk" type="checkbox" value="{pid}">
+              <input class="rowchk" type="checkbox" name="id" value="{pid}">
             </td>
             <td style="width:120px;"><code class="badge">{pid}</code></td>
             <td>{html_escape(fn)}</td>
@@ -2974,15 +2974,11 @@ async def _render_missing_list(
         else ("Nur Freelancer" if freelancer_mode == "only" else "Alle Kontakte")
     )
 
-    bulk_panel = """
+    bulk_panel = f"""
       <div class="panel" style="margin-bottom:12px;">
         <div style="display:flex; gap:10px; flex-wrap:wrap; align-items:center; justify-content:space-between;">
           <div style="display:flex; gap:10px; flex-wrap:wrap; align-items:center;">
-            <label class="small" style="display:flex; align-items:center; gap:8px;">
-              <input id="chk_all_rows" type="checkbox" onchange="toggleAllRows('chk_all_rows')">
-              Alle auswählen
-            </label>
-            <button class="btn btn-outline" onclick="bulkExport('person', '{field_key}')">Excel-Export</button>
+            <button class="btn btn-outline" type="submit">Excel-Export</button>
           </div>
         </div>
         <div class="small" style="margin-top:8px; opacity:.9;">
@@ -2997,28 +2993,32 @@ async def _render_missing_list(
           <div class="title">{html_escape(title)}</div>
           <div class="subtitle">{html_escape(subtitle)}</div>
         </div>
-        <div style="display:flex; gap:10px;">          {next_link}
+        <div style="display:flex; gap:10px;">{next_link}</div>
+      </div>
+
+      <form method="GET" action="/dq/bulk/xlsx/selected">
+        <input type="hidden" name="entity" value="person">
+        <input type="hidden" name="field_key" value="{html_escape(field_key)}">
+
+        {bulk_panel}
+
+        <div class="panel">
+          <table>
+            <thead>
+              <tr>
+                <th style="width:48px; text-align:center;"></th>
+                <th style="width:120px;">ID</th>
+                <th>Vorname</th>
+                <th>Nachname</th>
+                <th style="width:340px;">Aktion</th>
+              </tr>
+            </thead>
+            <tbody>
+              {''.join(trs) if trs else '<tr><td colspan="5">✅ Keine Treffer.</td></tr>'}
+            </tbody>
+          </table>
         </div>
-      </div>
-
-      {bulk_panel}
-
-      <div class="panel">
-        <table>
-          <thead>
-            <tr>
-              <th style="width:48px; text-align:center;"><input id="chk_all_rows_header" type="checkbox" onchange="toggleAllRows('chk_all_rows_header')"></th>
-              <th style="width:120px;">ID</th>
-              <th>Vorname</th>
-              <th>Nachname</th>
-              <th style="width:340px;">Aktion</th>
-            </tr>
-          </thead>
-          <tbody>
-            {''.join(trs) if trs else '<tr><td colspan="5">✅ Keine Treffer.</td></tr>'}
-          </tbody>
-        </table>
-      </div>
+      </form>
     """
     return HTMLResponse(page_shell(title, body))
 
@@ -4072,6 +4072,8 @@ async def db_count_email_mismatch(ttl_seconds: int = 300) -> Optional[int]:
                 if not email_dom:
                     continue
                 org_name = (r.get("org_name") or "").strip()
+                if org_name and org_name.lower() == FREELANCER_ORG_NAME.lower():
+                    continue
                 org_website = (r.get("org_website") or "").strip()
                 host = _extract_host_from_website(org_website)
 
@@ -4121,6 +4123,8 @@ async def _db_collect_email_mismatch_rows(after_id: int, limit: int, scan_batch:
                     continue
 
                 org_name = (r.get("org_name") or "").strip()
+                if org_name and org_name.lower() == FREELANCER_ORG_NAME.lower():
+                    continue
                 org_website = (r.get("org_website") or "").strip()
                 host = _extract_host_from_website(org_website)
 
@@ -4151,7 +4155,7 @@ async def _db_collect_email_mismatch_rows(after_id: int, limit: int, scan_batch:
 
 
 @app.get("/dq/contacts/org/missing", response_class=HTMLResponse)
-async def dq_contacts_missing_org(after_id: int = 0, limit: int = 200):
+async def dq_contacts_org_missing(after_id: int = 0, limit: int = 200):
     if "default" not in user_tokens:
         return RedirectResponse("/login")
     if not db_pool:
@@ -4189,7 +4193,7 @@ async def dq_contacts_missing_org(after_id: int = 0, limit: int = 200):
         ln = (r["last_name"] or "").strip() or "-"
         trs.append(f"""
           <tr>
-            <td style="width:48px; text-align:center;"><input class="rowchk" type="checkbox" value="{pid}"></td>
+            <td style="width:48px; text-align:center;"><input class="rowchk" type="checkbox" name="id" value="{pid}"></td>
             <td style="width:120px;"><code class="badge">{pid}</code></td>
             <td>{html_escape(fn)}</td>
             <td>{html_escape(ln)}</td>
@@ -4197,7 +4201,7 @@ async def dq_contacts_missing_org(after_id: int = 0, limit: int = 200):
               <details class="action-menu">
                  <summary class="chip chip-primary action-btn">⋯ Aktionen</summary>
                  <div class="menu" role="menu">
-                  <a class="menu-item" href="/dq/contacts/person/{pid}">Bearbeiten</a>
+                  <a class="menu-item" href="/dq/contacts/person/{pid}?back={back_q}">Bearbeiten</a>
                   <a class="menu-item" target="_blank" rel="noopener" href="{pipedrive_person_url(pid)}">Pipedrive ↗</a>
                   <a class="menu-item menu-danger" href="/dq/contacts/person/{pid}/delete_confirm?back={back_q}">🗑 Löschen</a>
                 </div>
@@ -4208,15 +4212,11 @@ async def dq_contacts_missing_org(after_id: int = 0, limit: int = 200):
 
     next_link = f'<a class="btn btn-outline" href="/dq/contacts/org/missing?after_id={last_id}&limit={limit}">Weiter →</a>' if rows else ""
 
-    bulk_panel = f"""
+    bulk_panel = """
       <div class="panel" style="margin-bottom:12px;">
         <div style="display:flex; gap:10px; flex-wrap:wrap; align-items:center; justify-content:space-between;">
           <div style="display:flex; gap:10px; flex-wrap:wrap; align-items:center;">
-            <label class="small" style="display:flex; align-items:center; gap:8px;">
-              <input id="chk_all_rows" type="checkbox" onchange="toggleAllRows('chk_all_rows')">
-              Alle auswählen
-            </label>
-            <button class="btn btn-outline" onclick="bulkExport('person', 'org_id')">Excel-Export</button>
+            <button class="btn btn-outline" type="submit">Excel-Export</button>
           </div>
         </div>
       </div>
@@ -4226,29 +4226,34 @@ async def dq_contacts_missing_org(after_id: int = 0, limit: int = 200):
       <div class="topbar">
         <div>
           <div class="title">Kontakte – Keine Organisation</div>
-          <div class="subtitle">Kontakte ohne zugeordnete Organisation </div>
+          <div class="subtitle">Kontakte ohne zugeordnete Organisation</div>
         </div>
         <div style="display:flex; gap:10px;">{next_link}</div>
       </div>
 
-      {bulk_panel}
+      <form method="GET" action="/dq/bulk/xlsx/selected">
+        <input type="hidden" name="entity" value="person">
+        <input type="hidden" name="field_key" value="org_id">
 
-      <div class="panel">
-        <table>
-          <thead>
-            <tr>
-              <th style="width:48px; text-align:center;"><input id="chk_all_rows_header" type="checkbox" onchange="toggleAllRows('chk_all_rows_header')"></th>
-              <th style="width:120px;">ID</th>
-              <th>Vorname</th>
-              <th>Nachname</th>
-              <th style="width:340px;">Aktion</th>
-            </tr>
-          </thead>
-          <tbody>
-            {''.join(trs) if trs else '<tr><td colspan="5">✅ Keine Treffer.</td></tr>'}
-          </tbody>
-        </table>
-      </div>
+        {bulk_panel}
+
+        <div class="panel">
+          <table>
+            <thead>
+              <tr>
+                <th style="width:48px; text-align:center;"></th>
+                <th style="width:120px;">ID</th>
+                <th>Vorname</th>
+                <th>Nachname</th>
+                <th style="width:340px;">Aktion</th>
+              </tr>
+            </thead>
+            <tbody>
+              {''.join(trs) if trs else '<tr><td colspan="5">✅ Keine Treffer.</td></tr>'}
+            </tbody>
+          </table>
+        </div>
+      </form>
     """
     return HTMLResponse(page_shell("Kontakte – Keine Organisation", body))
 
@@ -4370,7 +4375,7 @@ async def dq_contacts_email_mismatch(after_id: int = 0, limit: int = 200):
 
         trs.append(f"""
           <tr>
-            <td style="width:48px; text-align:center;"><input class="rowchk" type="checkbox" value="{pid}"></td>
+            <td style="width:48px; text-align:center;"><input class="rowchk" type="checkbox" name="id" value="{pid}"></td>
             <td style="width:120px;"><code class="badge">{pid}</code></td>
             <td>{html_escape(fn)}</td>
             <td>{html_escape(ln)}</td>
@@ -4381,7 +4386,7 @@ async def dq_contacts_email_mismatch(after_id: int = 0, limit: int = 200):
               <details class="action-menu">
                  <summary class="chip chip-primary action-btn">⋯ Aktionen</summary>
                  <div class="menu" role="menu">
-                  <a class="menu-item" href="/dq/contacts/person/{pid}">Bearbeiten</a>
+                  <a class="menu-item" href="/dq/contacts/person/{pid}?back={back_q}">Bearbeiten</a>
                   <a class="menu-item" target="_blank" rel="noopener" href="{pipedrive_person_url(pid)}">Pipedrive ↗</a>
                   <a class="menu-item menu-danger" href="/dq/contacts/person/{pid}/delete_confirm?back={back_q}">🗑 Löschen</a>
                 </div>
@@ -4394,15 +4399,11 @@ async def dq_contacts_email_mismatch(after_id: int = 0, limit: int = 200):
     if next_after and next_after > after_id:
         next_link = f'<a class="btn btn-outline" href="/dq/contacts/email/mismatch?after_id={next_after}&limit={limit}">Weiter →</a>'
 
-    bulk_panel = f"""
+    bulk_panel = """
       <div class="panel" style="margin-bottom:12px;">
         <div style="display:flex; gap:10px; flex-wrap:wrap; align-items:center; justify-content:space-between;">
           <div style="display:flex; gap:10px; flex-wrap:wrap; align-items:center;">
-            <label class="small" style="display:flex; align-items:center; gap:8px;">
-              <input id="chk_all_rows" type="checkbox" onchange="toggleAllRows('chk_all_rows')">
-              Alle auswählen
-            </label>
-            <button class="btn btn-outline" onclick="bulkExport('person', 'email')">Excel-Export</button>
+            <button class="btn btn-outline" type="submit">Excel-Export</button>
           </div>
         </div>
       </div>
@@ -4412,32 +4413,37 @@ async def dq_contacts_email_mismatch(after_id: int = 0, limit: int = 200):
       <div class="topbar">
         <div>
           <div class="title">Kontakte – E-Mail passt nicht zur Organisation</div>
-          <div class="subtitle">Heuristik: Domain passt nicht zur Website-Domain und/oder nicht zum Organisationsnamen </div>
+          <div class="subtitle">Heuristik: Domain passt nicht zur Website-Domain und/oder nicht zum Organisationsnamen</div>
         </div>
         <div style="display:flex; gap:10px;">{next_link}</div>
       </div>
 
-      {bulk_panel}
+      <form method="GET" action="/dq/bulk/xlsx/selected">
+        <input type="hidden" name="entity" value="person">
+        <input type="hidden" name="field_key" value="email">
 
-      <div class="panel">
-        <table>
-          <thead>
-            <tr>
-              <th style="width:48px; text-align:center;"><input id="chk_all_rows_header" type="checkbox" onchange="toggleAllRows('chk_all_rows_header')"></th>
-              <th style="width:120px;">ID</th>
-              <th>Vorname</th>
-              <th>Nachname</th>
-              <th>E-Mail</th>
-              <th>Organisation</th>
-              <th style="width:120px;">Grund</th>
-              <th style="width:340px;">Aktion</th>
-            </tr>
-          </thead>
-          <tbody>
-            {''.join(trs) if trs else '<tr><td colspan="8">✅ Keine Treffer.</td></tr>'}
-          </tbody>
-        </table>
-      </div>
+        {bulk_panel}
+
+        <div class="panel">
+          <table>
+            <thead>
+              <tr>
+                <th style="width:48px; text-align:center;"></th>
+                <th style="width:120px;">ID</th>
+                <th>Vorname</th>
+                <th>Nachname</th>
+                <th>E-Mail</th>
+                <th>Organisation</th>
+                <th style="width:120px;">Grund</th>
+                <th style="width:340px;">Aktion</th>
+              </tr>
+            </thead>
+            <tbody>
+              {''.join(trs) if trs else '<tr><td colspan="8">✅ Keine Treffer.</td></tr>'}
+            </tbody>
+          </table>
+        </div>
+      </form>
     """
     return HTMLResponse(page_shell("Kontakte – E-Mail passt nicht", body))
 
