@@ -2599,7 +2599,6 @@ async def overview(request: Request):
     """
     return HTMLResponse(page_shell("Datenqualität – Übersicht", body))
 
-onse(page_shell("Datenqualität – Übersicht", body, back_href=""))
 
 
 @app.get("/overview/contacts", response_class=HTMLResponse)
