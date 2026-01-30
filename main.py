@@ -540,6 +540,7 @@ async def dq_bulk_csv_export(entity: str = Query(...), ids: str = Query(...)):
 
 
 @app.get("/dq/bulk/xlsx/selected")
+@app.post("/dq/bulk/xlsx/selected")
 async def dq_bulk_xlsx_export_selected(entity: str = Query(...), ids: str = Query(""), id: list[int] = Query(default=[]), field_key: str = Query("")):
     """
     Excel-Export (XLSX) für ausgewählte Datensätze.
@@ -556,6 +557,12 @@ async def dq_bulk_xlsx_export_selected(entity: str = Query(...), ids: str = Quer
 
     entity = (entity or "").strip().lower()
     id_list = _parse_ids_param(ids)
+    # Support both ?ids=1,2,3 and repeated query params ?id=1&id=2 (used by no-JS forms)
+    if not id_list and id:
+        try:
+            id_list = [int(x) for x in id]
+        except Exception:
+            id_list = []
     if entity not in ("person", "organization"):
         return JSONResponse({"ok": False, "error": "entity muss person|organization sein"}, status_code=400)
     if not id_list:
